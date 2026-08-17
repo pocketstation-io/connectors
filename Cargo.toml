@@ -1,0 +1,16 @@
+[workspace]
+members = ["relay"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.95.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pocketstation-io/connectors"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
