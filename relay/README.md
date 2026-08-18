@@ -36,6 +36,7 @@ let application_endpoint = registered.declare(
         "application",
     )?
     .connector_configuration()?,
+    pocketstation::EdgeContract::realtime_audio(),
 )?;
 let microphone_endpoint = registered.declare(
     &session,
@@ -46,6 +47,7 @@ let microphone_endpoint = registered.declare(
         "microphone",
     )?
     .connector_configuration()?,
+    pocketstation::EdgeContract::realtime_audio(),
 )?;
 
 application.send(application_endpoint)?;

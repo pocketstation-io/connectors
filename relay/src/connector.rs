@@ -8,8 +8,8 @@ use pocketstation::connector::{
     ConnectorRegistrationError, ConnectorRequirement, RegisteredConnector,
 };
 use pocketstation::graph::{
-    AudioCaps, ChannelLayout, EdgeContract, ExecutionPartition, MediaCaps, Multiplicity,
-    NodeDescriptor, NodeTypeId, PortDirection, PortSpec, SafetyContract, SignalSpec,
+    AudioCaps, ChannelLayout, ExecutionPartition, MediaCaps, Multiplicity, NodeDescriptor,
+    NodeTypeId, PortDirection, PortSpec, SafetyContract, SignalSpec,
 };
 use pocketstation::{OperatorId, SampleFormat, Session};
 
@@ -188,7 +188,6 @@ pub fn relay_connector_manifest() -> Result<ConnectorManifest, RelayConnectorBui
         env!("CARGO_PKG_VERSION"),
         node,
         configuration,
-        EdgeContract::realtime_audio(),
         ConnectorReadinessPolicy::new(
             std::time::Duration::from_millis(DEFAULT_STARTUP_TIMEOUT_MS),
             std::time::Duration::from_millis(100),

@@ -939,7 +939,11 @@ mod tests {
         .connector_configuration()
         .expect("connector configuration");
         registered
-            .declare(session, configuration)
+            .declare(
+                session,
+                configuration,
+                pocketstation::EdgeContract::realtime_audio(),
+            )
             .expect("relay endpoint declaration")
     }
 
@@ -1243,10 +1247,7 @@ mod tests {
     #[test]
     fn manifest_and_configuration_keep_secrets_redacted() {
         let manifest = relay_connector_manifest().expect("manifest");
-        assert_eq!(
-            manifest.input_edge(),
-            pocketstation::EdgeContract::realtime_audio()
-        );
+        assert_eq!(manifest.node().inputs().len(), 1);
         let configuration = RelayRouteConfiguration::new(
             "https://relay.invalid",
             "session-a",
