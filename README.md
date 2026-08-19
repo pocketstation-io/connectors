@@ -1,215 +1,166 @@
-# PocketStation connectors
+# PocketStation Connector Registry
 
-Connect a PocketStation Session to an external service without teaching Core
-about providers, protocols, credentials, or network clients.
+Find the first-party packages that connect a PocketStation Session to an
+external service.
 
-This repository contains independently packaged implementations of
-PocketStation's open `Connector` contract. The first package is
-[`pocketstation-relay`](relay): a bounded WebRTC publisher for
-[PocketStation Relay](https://github.com/pocketstation-io/relay).
+This repository is the source registry and shared verification workspace for
+connectors maintained by the PocketStation project. Each connector is an
+independent package with its own protocol scope, compatibility contract,
+documentation, tests, and release lifecycle.
 
-```text
-source-aware PocketStation stems
-  → Core Connector / Endpoint lifecycle
-      → provider adapter in this repository
-          → external service
-```
+The repository root is a catalog. Package-specific setup and implementation
+guidance belongs inside each connector directory.
 
-## Start publishing
+## Available connectors
 
-```bash
-cargo add pocketstation pocketstation-relay
-```
+| Connector | Package | Direction | Connects to | Release | Documentation |
+|---|---|---|---|---|---|
+| PocketStation Relay | [`pocketstation-relay`](https://crates.io/crates/pocketstation-relay) | outbound audio | [PocketStation Relay](https://github.com/pocketstation-io/relay) over WebRTC | `0.1.1` | [Guide](relay/README.md) · [Rust API](https://docs.rs/pocketstation-relay) |
 
-```rust,no_run
-use pocketstation::connector::ConnectorSecret;
-use pocketstation::{ApplicationSelector, EdgeContract, Session, Source};
-use pocketstation_relay::{RelayConnector, RelayRouteConfiguration};
+That is the complete first-party registry today. A connector not listed here
+does not inherit PocketStation maintenance, compatibility, or evidence claims.
 
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-let session = Session::builder().recording_root("recordings").build();
-let application = session.capture(Source::application(
-    ApplicationSelector::name("PocketStation Demo"),
-))?;
+## Choose a connector
 
-let relay = RelayConnector::new()?;
-let registered = relay.register(&session)?;
-let endpoint = registered.declare(
-    &session,
-    RelayRouteConfiguration::new(
-        "https://relay.example.com",
-        "relay-session-id",
-        ConnectorSecret::new("source-token")?,
-        "application",
-    )?
-    .connector_configuration()?,
-    EdgeContract::realtime_audio(),
-)?;
+Use `pocketstation-relay` when you need to publish independent, named audio
+buses from a Rust PocketStation Session to PocketStation Relay.
 
-application.send(endpoint)?;
-application.record("application")?;
+There is not currently a first-party LiveKit, generic WHIP, OpenAI, Deepgram,
+or arbitrary WebRTC connector in this registry. Those services have different
+authentication, negotiation, lifecycle, and outcome contracts. Support requires
+a dedicated adapter; changing a URL is not sufficient.
 
-let mut running = session.start()?;
-let stop = running.stop();
-assert!(stop.is_success());
-# Ok(())
-# }
-```
+For installation and a complete application-plus-microphone example, go
+directly to the [PocketStation Relay connector guide](relay/README.md).
 
-The connector does not create a hidden Relay server. The Relay origin, Session
-identity, and source credential come from infrastructure you operate or a
-control plane you explicitly call.
+## What “first-party” means
 
-## One Session model, clear ownership
+A connector in this registry must have all of the following:
 
-| Layer | Responsibility |
-|---|---|
-| PocketStation Core | graph compilation, bounded routes, lineage, lifecycle, recording, observations |
-| Connector package | provider configuration, protocol client, readiness, provider errors, transport outcomes |
-| Provider service | network protocol, authentication authority, remote delivery |
-
-Core remains provider-neutral. It does not contain WebRTC, LiveKit, WHIP,
-OpenAI, Deepgram, or PocketStation Relay behavior. A different provider is a
-different connector package using the same lifecycle—not a new Core enum or a
-special Session mode.
-
-## What the Relay connector guarantees
-
-`pocketstation-relay` turns one or more PocketStation audio routes into one
-grouped Relay publisher:
-
-- independent application and microphone stems remain independent named
-  `AudioBus` publications;
-- routes with the same Relay origin, Session, credential, publisher group, ICE
-  configuration, and deadline share one transactional publisher lifecycle;
-- input is bounded 48 kHz interleaved `f32` PCM;
-- encoding and network work remain outside realtime capture callbacks;
-- one finite deadline covers DNS, signaling, ICE, and DTLS startup;
-- source credentials use Core's redacting `ConnectorSecret`;
-- preparation, rollback, start gating, drain/abort, join, and finalization use
-  the canonical Core Endpoint lifecycle;
-- provider failures retain stable codes, stages, and retryability;
-- per-route receipts preserve source, stem, route, and bus correlation.
-
-## Publish application and microphone together
-
-Declare both endpoints from the same registered connector and give their route
-configurations the same publisher group. The connector groups them into one
-publisher while retaining two bus identities:
-
-```text
-application stem ──→ application bus ──┐
-                                       ├─ one authenticated PeerConnection
-microphone stem  ──→ microphone bus  ──┘
-```
-
-If any grouped route cannot prepare, Core rolls back the group before the start
-gate opens. Shutdown can drain accepted work or abort it explicitly through the
-existing Endpoint contract.
-
-See the [crate guide](relay/README.md) for the complete two-stem example and
-configuration API.
-
-## Configuration model
-
-The public Relay configuration is typed:
-
-```rust,no_run
-# use std::time::Duration;
-# use pocketstation::connector::ConnectorSecret;
-# use pocketstation_relay::{RelayIceServer, RelayRouteConfiguration};
-# fn config() -> Result<(), Box<dyn std::error::Error>> {
-let route = RelayRouteConfiguration::new(
-    "https://relay.example.com",
-    "relay-session-id",
-    ConnectorSecret::new("source-token")?,
-    "microphone",
-)?
-.with_publisher_group("demo-publisher")?
-.with_ice_servers([
-    RelayIceServer::new(["stun:stun.example.com:3478"])?
-])?
-.with_startup_timeout(Duration::from_secs(20))?
-.with_low_latency();
-# let _ = route;
-# Ok(())
-# }
-```
-
-Validation happens before Session startup. Secret values are never exposed by
-`Debug`. Capacities and deadlines are finite. Invalid URLs, identities, bus
-labels, ICE configuration, or timeout values fail as typed configuration
-errors.
-
-## What this repository is—and is not
-
-This is a small set of maintained connector packages, not a speculative
-provider catalog.
-
-A package belongs here only when it has:
-
-- a real product or ecosystem need;
-- an explicit maintainer and compatibility policy;
-- executable Connector conformance tests;
+- a named maintainer and an active product or ecosystem requirement;
+- a finite, typed configuration contract with secret redaction;
+- an explicit provider/protocol compatibility boundary;
+- canonical PocketStation Connector and Endpoint lifecycle integration;
+- bounded preparation, delivery, cancellation, drain/abort, and shutdown;
+- stable provider error classification and observable terminal outcomes;
+- executable conformance, saturation, rollback, and failure tests;
 - real protocol integration evidence;
-- bounded failure and shutdown behavior;
-- independent packaging and consumer verification.
+- an independently installable package and isolated consumer proof;
+- an intentional versioning and compatibility policy.
 
-The current Relay connector works with PocketStation Relay. It is not a
-universal SFU client and cannot be pointed at LiveKit or an arbitrary WHIP
-endpoint. Those protocols require their own adapters.
+Passing component tests does not automatically establish remote production
+readiness, every network topology, every platform, or competitive superiority.
+Those claims require separately identified evidence.
 
-The current package also supports STUN discovery but does not allocate TURN
-credentials. Networks that require TURN need a later connector revision or a
-different adapter.
-
-## Repository map
+## Architecture boundary
 
 ```text
-relay/
-  Cargo.toml
-  README.md
-  src/
-    configuration.rs   typed, secret-aware provider configuration
-    connector.rs       Core Connector registration and manifest
-    runtime.rs         grouped lifecycle and terminal receipts
-    frame_publisher.rs bounded route-to-bus publication
-    audio/             PCM packetization, clocking and Opus workers
-    rtc/               signaling, ICE/DTLS and WebRTC publication
-  tests/
-    portable_semantics.rs
+PocketStation Core
+  Session + Graph + Endpoint lifecycle
+              ↓
+        Connector contract
+              ↓
+independently packaged provider adapter
+              ↓
+      external service or protocol
 ```
 
-Related repositories:
+Responsibilities stay deliberately separated:
 
-- [pocketstation](https://github.com/pocketstation-io/pocketstation) — the
-  provider-neutral runtime and Connector contract;
-- [relay](https://github.com/pocketstation-io/relay) — the Go Relay service and
-  public signaling contract;
-- `pocketstation-lab` — cross-repository product proof;
-- `pocketstation-bench` — neutral transport measurement.
+| Owner | Responsibility |
+|---|---|
+| [`pocketstation`](https://github.com/pocketstation-io/pocketstation) | provider-neutral graph, bounded routing, lineage, lifecycle, recording, observations, Connector contract |
+| This registry | first-party connector packages, compatibility, conformance, packaging, release ownership |
+| Provider/service repository | wire protocol, server behavior, authentication authority, remote delivery |
 
-## Verify the package
+Connectors are outbound Endpoint specializations. Inbound media remains a
+PocketStation `Source`; transformations remain `Operator`s. A larger
+bidirectional integration may compose all three without introducing another
+Session or runtime.
+
+Core never gains a closed provider enum. Adding a connector must not add its
+WebRTC, SDK, authentication, or protocol dependencies to Core.
+
+## Registry policy
+
+This is a curated first-party registry, not a collection of every possible
+integration.
+
+A proposed connector moves through these stages:
+
+1. **Scope** — identify a real user workflow and the exact protocol boundary.
+2. **Ownership** — assign maintainers, security ownership, and compatibility
+   responsibilities.
+3. **Contract** — declare inputs, capabilities, configuration, credentials,
+   limits, readiness, errors, and outcomes.
+4. **Implementation** — use the canonical Core lifecycle without duplicating
+   graph, queue, or Session authority.
+5. **Conformance** — prove rollback, saturation, discontinuity, cancellation,
+   drain/abort, failure containment, and exact destruction.
+6. **Integration** — exercise the real external service and record the evidence
+   boundary honestly.
+7. **Distribution** — package, inspect, install, and run from an isolated
+   consumer before release.
+
+An example or experimental adapter is not promoted into this registry merely
+because it compiles.
+
+## Repository layout
+
+```text
+connectors/
+├── README.md          this registry and its policies
+├── Cargo.toml         shared verification workspace only
+└── relay/
+    ├── README.md      package setup, behavior, and operational limits
+    ├── Cargo.toml     independently released crate
+    ├── src/           Relay-specific implementation
+    └── tests/         package and portable-semantics conformance
+```
+
+Package directories own their user documentation. The repository README owns
+only discovery, support status, shared boundaries, and registry policy.
+
+## Versioning and compatibility
+
+Connector packages version independently from this repository and from
+PocketStation Core.
+
+- Published crate versions and Git tags are immutable.
+- Each package declares the Core versions it supports.
+- Provider protocol compatibility is proved by that package, not inferred from
+  Core's trait definitions.
+- A breaking provider or public Rust API change requires the package's normal
+  semantic-versioning process.
+- A repository commit is not a release until its package artifact, tag, and
+  isolated consumer agree on the same source.
+
+Current compatibility:
+
+| Package | Connector version | PocketStation Core | Evidence boundary |
+|---|---:|---:|---|
+| `pocketstation-relay` | `0.1.1` | `1.1.1` | component and same-host integration; remote production breadth not implied |
+
+## Develop and verify the registry
+
+Run the complete workspace gate from the repository root:
 
 ```bash
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo package -p pocketstation-relay --locked
 ```
 
-## Compatibility and evidence
+Package and real-service verification requirements remain in each connector's
+own guide and release process.
 
-The current crate release is `pocketstation-relay 0.1.1` and consumes
-PocketStation Core `1.1.1`. Pre-1.0 connector releases may evolve, but published
-versions and tags are immutable.
+## Community connectors
 
-Current evidence proves the component and same-host integration paths. It does
-not by itself establish remote production readiness, every NAT topology,
-cross-platform distribution, or performance superiority over another
-transport. Those claims require explicit Lab and Bench artifacts.
+Third-party connectors can implement the same open Core contract without
+living in this repository. Their maintainers own distribution, provider
+compatibility, security response, and support claims.
 
-The design goal is simple: provider integrations should feel native to a
-PocketStation Session while remaining independently owned, testable, and
-replaceable.
+If a community connector is later considered for first-party support, it must
+pass the registry policy above. Adoption is an ownership commitment—not only a
+directory move.
