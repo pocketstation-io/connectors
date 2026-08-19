@@ -1,3 +1,11 @@
 /target/
 **/*.rs.bk
 
+# Private engineering control and progress documents.
+/AGENTS.md
+/PHASE*_PROGRESS.md
+/PHASE*_QUEUE.md
+/docs/adr/
+/docs/development/
+/docs/execution/
+/docs/reports/
