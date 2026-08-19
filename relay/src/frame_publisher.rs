@@ -1,6 +1,5 @@
 use std::error::Error;
 use std::sync::{mpsc, Arc};
-use std::time::Instant;
 
 use pocketstation::codec::StreamProfile;
 
@@ -19,7 +18,6 @@ pub(crate) struct PreparedFramePublisher {
     pub(crate) handshake: HandshakeResult,
     pub(crate) session_id: String,
     pub(crate) streams: Vec<PreparedFrameStream>,
-    pub(crate) deadline: Option<Instant>,
 }
 
 pub(crate) struct PreparedFrameStream {
@@ -80,7 +78,6 @@ where
         ws,
         bound_addr,
         publish_streams,
-        prepared.deadline,
         &prepared.session_id,
     );
     Ok(FramePublisherExecution {

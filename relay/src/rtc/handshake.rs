@@ -2,6 +2,8 @@
 
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 use str0m::change::SdpAnswer;
 use str0m::media::{Direction, MediaKind, Mid};
@@ -12,14 +14,12 @@ use url::Url;
 use crate::configuration::RelayIceServer;
 use crate::rtc::signaling::{
     send_leave, wait_for_sdp_answer, ws_set_read_timeout, ws_set_write_timeout, PublishBusBinding,
-    PublishMsg, ServerMsg, Ws,
+    PublishMsg, ServerMsg, Ws, WS_POLL_TIMEOUT, WS_WRITE_TIMEOUT,
 };
 use crate::rtc::types::drain_all_outputs;
 
 /// UDP socket read timeout — short enough to pace the RTC event loop without starving it.
 const UDP_READ_TIMEOUT_MS: u64 = 5;
-/// WebSocket read timeout used during the ICE loop so we don't block on the signaling channel.
-const WS_POLL_TIMEOUT_MS: u64 = 1;
 /// Timeout for the STUN binding request. 2 s is generous; local NAT round-trip is <100 ms.
 const STUN_TIMEOUT_MS: u64 = 2_000;
 
@@ -70,9 +70,10 @@ pub(crate) struct PublishMedia {
 // UDP connect just sets routing state so local_addr() returns the real
 // outbound interface address instead of 0.0.0.0.
 
-pub(crate) fn probe_local_ip(relay_url: &str) -> Result<IpAddr, Box<dyn std::error::Error>> {
-    use std::net::ToSocketAddrs;
-
+pub(crate) fn probe_local_ip(
+    relay_url: &str,
+    deadline: Instant,
+) -> Result<IpAddr, Box<dyn std::error::Error>> {
     let host_part = relay_url
         .trim_start_matches("https://")
         .trim_start_matches("http://")
@@ -91,7 +92,7 @@ pub(crate) fn probe_local_ip(relay_url: &str) -> Result<IpAddr, Box<dyn std::err
     // ICE generates IPv4 host candidates.  If the local candidate is IPv6 and
     // the only remote candidates are IPv4, str0m forms no pairs and ICE never
     // checks.  Fall back to the first address of any family if no IPv4 exists.
-    let all_addrs: Vec<SocketAddr> = addr_str.to_socket_addrs()?.collect();
+    let all_addrs = resolve_before_deadline(addr_str, deadline)?;
     let relay_addr = all_addrs
         .iter()
         .find(|address| address.is_ipv4())
@@ -159,11 +160,12 @@ fn probe_srflx_inner(
     } else {
         format!("{stun_authority}:3478")
     };
-    let stun_addr = stun_endpoint
-        .to_socket_addrs()
-        .ok()?
-        .find(SocketAddr::is_ipv4)
-        .or_else(|| stun_endpoint.to_socket_addrs().ok()?.next())?;
+    let stun_addresses = resolve_before_deadline(stun_endpoint, deadline).ok()?;
+    let stun_addr = stun_addresses
+        .iter()
+        .find(|address| address.is_ipv4())
+        .or_else(|| stun_addresses.first())
+        .copied()?;
 
     // STUN Binding Request: 20-byte header, no attributes.
     // Magic cookie: 0x2112A442 (RFC 5389 §6).
@@ -240,7 +242,12 @@ fn connect_signaling(
     let port = url
         .port_or_known_default()
         .ok_or("relay signaling URL has no usable port")?;
-    let addresses = (host, port).to_socket_addrs()?.collect::<Vec<_>>();
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let addresses = resolve_before_deadline(authority, deadline)?;
     if addresses.is_empty() {
         return Err("relay signaling host resolved to no addresses".into());
     }
@@ -268,6 +275,58 @@ fn connect_signaling(
             |error| format!("relay signaling connection failed: {error}"),
         )
         .into())
+}
+
+fn resolve_before_deadline(
+    authority: String,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or("relay name resolution exceeded its startup deadline")?;
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("pks-relay-resolver".to_owned())
+        .spawn(move || {
+            let result = authority.to_socket_addrs().map(Iterator::collect::<Vec<_>>);
+            let _ = result_tx.send(result);
+        })?;
+    match result_rx.recv_timeout(remaining) {
+        Ok(Ok(addresses)) if !addresses.is_empty() => Ok(addresses),
+        Ok(Ok(_)) => Err("relay name resolved to no addresses".into()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("relay name resolution exceeded its startup deadline".into())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("relay name resolver exited without a result".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod network_deadline_tests {
+    use super::resolve_before_deadline;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn expired_resolution_deadline_fails_before_starting_network_work() {
+        let error = resolve_before_deadline("localhost:80".to_owned(), Instant::now())
+            .expect_err("expired DNS budget must fail");
+
+        assert!(error.to_string().contains("startup deadline"));
+    }
+
+    #[test]
+    fn loopback_resolution_completes_inside_a_finite_budget() {
+        let addresses = resolve_before_deadline(
+            "localhost:80".to_owned(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("loopback name must resolve");
+
+        assert!(!addresses.is_empty());
+    }
 }
 
 // Shared ICE/DTLS handshake
@@ -305,7 +364,7 @@ pub(crate) fn run_handshake(
     let bound_port = udp.local_addr()?.port();
 
     // Resolve the real outbound IP — 0.0.0.0 is not a valid ICE candidate.
-    let candidate_ip = probe_local_ip(relay_url)?;
+    let candidate_ip = probe_local_ip(relay_url, startup_deadline)?;
     let bound_addr = SocketAddr::new(candidate_ip, bound_port);
 
     // 2. Build str0m Rtc instance with Opus only, no video codecs.
@@ -397,8 +456,8 @@ pub(crate) fn run_handshake(
     let remaining = startup_deadline
         .checked_duration_since(Instant::now())
         .ok_or("relay startup timed out before the SDP answer")?;
-    ws_set_read_timeout(&ws, Some(remaining));
-    ws_set_write_timeout(&ws, Some(remaining));
+    ws_set_read_timeout(&ws, Some(remaining))?;
+    ws_set_write_timeout(&ws, Some(remaining))?;
     let signaling_answer = wait_for_sdp_answer(&mut ws, room_id)?;
     let sdp_answer = SdpAnswer::from_sdp_string(&signaling_answer.sdp_answer)
         .map_err(|e| format!("failed to parse SDP answer: {e:?}"))?;
@@ -421,7 +480,7 @@ pub(crate) fn run_handshake(
     //
     // One poll_output() call per iteration so no event can be consumed
     // and dropped by a helper that only pattern-matches on Transmit.
-    ws_set_read_timeout(&ws, Some(Duration::from_millis(WS_POLL_TIMEOUT_MS)));
+    ws_set_read_timeout(&ws, Some(WS_POLL_TIMEOUT))?;
 
     let mut connected = false;
     let mut udp_buf = [0u8; 2048];
@@ -502,10 +561,9 @@ pub(crate) fn run_handshake(
         .into());
     }
 
-    // Restore blocking WebSocket reads during the streaming phase
-    // (we won't read it in the hot loop, only write ICE/LEAVE msgs).
-    ws_set_read_timeout(&ws, None);
-    ws_set_write_timeout(&ws, None);
+    // Publisher I/O remains deadline-bounded for its complete lifetime.
+    ws_set_read_timeout(&ws, Some(WS_POLL_TIMEOUT))?;
+    ws_set_write_timeout(&ws, Some(WS_WRITE_TIMEOUT))?;
 
     Ok(HandshakeResult {
         rtc,

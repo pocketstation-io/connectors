@@ -3,6 +3,7 @@
 //! Mirrors `relay/internal/signaling/messages.go`.
 
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
 
@@ -59,6 +60,9 @@ pub(crate) struct ServerMsg {
 
 pub(crate) type Ws = tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>;
 
+pub(crate) const WS_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+pub(crate) const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub(crate) struct SignalingAnswer {
     pub(crate) sdp_answer: String,
     /// Relay candidates may race ahead of the SDP answer on a local or very
@@ -69,32 +73,28 @@ pub(crate) struct SignalingAnswer {
 
 // Set a read timeout on the underlying TCP stream inside a tungstenite WebSocket.
 
-pub(crate) fn ws_set_read_timeout(ws: &Ws, timeout: Option<Duration>) {
+pub(crate) fn ws_set_read_timeout(ws: &Ws, timeout: Option<Duration>) -> io::Result<()> {
     // MaybeTlsStream exposes the inner stream reference.  We need to reach
     // the TcpStream to call set_read_timeout.  Match on all known variants;
     // use a wildcard for any future variant added by tungstenite.
     match ws.get_ref() {
-        MaybeTlsStream::Plain(tcp) => {
-            let _ = tcp.set_read_timeout(timeout);
-        }
-        MaybeTlsStream::NativeTls(tls) => {
-            let _ = tls.get_ref().set_read_timeout(timeout);
-        }
-        // Rustls variant has no set_read_timeout on the owned stream —
-        // silently accept that the WebSocket read may block briefly.
-        _ => {}
+        MaybeTlsStream::Plain(tcp) => tcp.set_read_timeout(timeout),
+        MaybeTlsStream::NativeTls(tls) => tls.get_ref().set_read_timeout(timeout),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "relay WebSocket transport does not expose a readable TCP timeout",
+        )),
     }
 }
 
-pub(crate) fn ws_set_write_timeout(ws: &Ws, timeout: Option<Duration>) {
+pub(crate) fn ws_set_write_timeout(ws: &Ws, timeout: Option<Duration>) -> io::Result<()> {
     match ws.get_ref() {
-        MaybeTlsStream::Plain(tcp) => {
-            let _ = tcp.set_write_timeout(timeout);
-        }
-        MaybeTlsStream::NativeTls(tls) => {
-            let _ = tls.get_ref().set_write_timeout(timeout);
-        }
-        _ => {}
+        MaybeTlsStream::Plain(tcp) => tcp.set_write_timeout(timeout),
+        MaybeTlsStream::NativeTls(tls) => tls.get_ref().set_write_timeout(timeout),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "relay WebSocket transport does not expose a writable TCP timeout",
+        )),
     }
 }
 

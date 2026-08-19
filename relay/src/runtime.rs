@@ -373,7 +373,6 @@ impl RelayPublishTransport for NativeRelayPublishTransport {
                 handshake,
                 session_id: configuration.relay_session_id,
                 streams,
-                deadline: None,
             },
         }))
     }

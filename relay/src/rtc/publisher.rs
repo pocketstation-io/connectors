@@ -9,7 +9,9 @@ use str0m::net::{Protocol, Receive};
 use str0m::{Input, Rtc};
 
 use crate::audio::opus_worker::{EncodedAudioFrame, EncoderCounters};
-use crate::rtc::signaling::{send_leave, ws_set_read_timeout, Ws};
+use crate::rtc::signaling::{
+    send_leave, ws_set_read_timeout, ws_set_write_timeout, Ws, WS_POLL_TIMEOUT, WS_WRITE_TIMEOUT,
+};
 use crate::rtc::types::drain_all_outputs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,13 +47,29 @@ fn try_recv_frame(
     }
 }
 
+fn classify_signaling_read(
+    result: tungstenite::Result<tungstenite::Message>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match result {
+        Ok(tungstenite::Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => {
+            Err("relay signaling connection closed during publication".into())
+        }
+        Ok(_) => Ok(()),
+        Err(tungstenite::Error::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(format!("relay signaling connection failed: {error}").into()),
+    }
+}
+
 /// How often the source sends a WebSocket ping to the relay.
 /// The relay kills connections that are silent for 90 s; 45 s keeps us well within that window.
 const WS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(45);
-
-/// Non-blocking WebSocket poll timeout: short enough to avoid busy-spinning,
-/// long enough to read any pending relay Ping so we can auto-reply with Pong.
-const WS_POLL_TIMEOUT_MS: u64 = 1;
 
 // RTP publisher loop
 
@@ -104,7 +122,6 @@ pub(crate) fn run_publish_loop(
     mut ws: Ws,
     bound_addr: SocketAddr,
     streams: Vec<PublishStream>,
-    deadline: Option<Instant>,
     room: &str,
 ) -> Result<PublishStats, Box<dyn std::error::Error>> {
     if streams.is_empty() {
@@ -135,7 +152,8 @@ pub(crate) fn run_publish_loop(
     // Re-enable the short poll timeout so we can call ws.read() in the idle
     // section without stalling the RTP loop, and so tungstenite can auto-reply
     // to relay Pings with Pong (it only does so when read() is called).
-    ws_set_read_timeout(&ws, Some(Duration::from_millis(WS_POLL_TIMEOUT_MS)));
+    ws_set_read_timeout(&ws, Some(WS_POLL_TIMEOUT))?;
+    ws_set_write_timeout(&ws, Some(WS_WRITE_TIMEOUT))?;
 
     udp.set_nonblocking(true)
         .map_err(|e| format!("UDP set_nonblocking: {e}"))?;
@@ -153,12 +171,6 @@ pub(crate) fn run_publish_loop(
     let mut last_ws_ping = Instant::now();
 
     'publish: loop {
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl {
-                break 'publish;
-            }
-        }
-
         let now = Instant::now();
 
         // ── Priority 1: RTC timeout tick ─────────────────────────────────
@@ -270,18 +282,7 @@ pub(crate) fn run_publish_loop(
         //      this the relay's read deadline fires and closes the session.
         //   2. It blocks for at most WS_POLL_TIMEOUT_MS ms, which throttles
         //      this idle branch the same way a 1 ms sleep would.
-        match ws.read() {
-            Ok(tungstenite::Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => {
-                break 'publish
-            }
-            Ok(_) => {}
-            Err(tungstenite::Error::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => return Err(format!("relay signaling connection failed: {error}").into()),
-        }
+        classify_signaling_read(ws.read())?;
     }
 
     let _ = send_leave(&mut ws, room);
@@ -355,5 +356,21 @@ mod tests {
             rx.try_recv().unwrap().rtp_time,
             MediaTime::new(1920, Frequency::FORTY_EIGHT_KHZ)
         );
+    }
+
+    #[test]
+    fn given_remote_signaling_close_when_classified_then_publication_fails() {
+        let error = classify_signaling_read(Ok(tungstenite::Message::Close(None)))
+            .expect_err("remote close must not look like a clean local stop");
+
+        assert!(error.to_string().contains("closed during publication"));
+    }
+
+    #[test]
+    fn given_signaling_read_timeout_when_classified_then_publication_continues() {
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "bounded poll");
+
+        classify_signaling_read(Err(tungstenite::Error::Io(timeout)))
+            .expect("bounded idle timeout is not a transport failure");
     }
 }
