@@ -1,19 +1,34 @@
 # PocketStation Relay connector
 
-`pocketstation-relay` publishes named, source-aware PocketStation
-audio stems to PocketStation Relay through the public
-`pocketstation::connector` contract.
+Publish independent PocketStation audio stems to PocketStation Relay through
+the canonical `pocketstation::connector` lifecycle.
 
-The package owns client-side Opus, RTP, WebRTC, and PocketStation Relay
-signaling. PocketStation Core remains provider-neutral. A LiveKit, WHIP, or
-other transport integration is a separate connector package using the same
-Core contract; this package is not a universal relay client.
+`pocketstation-relay` owns the client-side Opus, RTP, WebRTC, and Relay
+signaling implementation. PocketStation Core continues to own graph
+compilation, bounded delivery, lineage, recording, and transactional lifecycle.
 
-## Two independent buses, one publisher lifecycle
+```text
+application stem ──→ application AudioBus ──┐
+                                            ├─ grouped Relay publisher
+microphone stem  ──→ microphone AudioBus  ──┘
+```
+
+## Install
+
+```bash
+cargo add pocketstation pocketstation-relay
+```
+
+You also need a reachable
+[PocketStation Relay](https://github.com/pocketstation-io/relay) service and a
+valid RelaySession source credential. The crate never starts hidden
+infrastructure.
+
+## Publish two source-aware buses
 
 ```rust,no_run
 use pocketstation::connector::ConnectorSecret;
-use pocketstation::{ApplicationSelector, Session, Source};
+use pocketstation::{ApplicationSelector, EdgeContract, Session, Source};
 use pocketstation_relay::{RelayConnector, RelayRouteConfiguration};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,8 +51,9 @@ let application_endpoint = registered.declare(
         "application",
     )?
     .connector_configuration()?,
-    pocketstation::EdgeContract::realtime_audio(),
+    EdgeContract::realtime_audio(),
 )?;
+
 let microphone_endpoint = registered.declare(
     &session,
     RelayRouteConfiguration::new(
@@ -47,7 +63,7 @@ let microphone_endpoint = registered.declare(
         "microphone",
     )?
     .connector_configuration()?,
-    pocketstation::EdgeContract::realtime_audio(),
+    EdgeContract::realtime_audio(),
 )?;
 
 application.send(application_endpoint)?;
@@ -56,28 +72,114 @@ application.record("application")?;
 microphone.record("microphone")?;
 
 let mut running = session.start()?;
-// The application controls its own bounded run loop or shutdown signal.
 let stop = running.stop();
 assert!(stop.is_success());
 # Ok(())
 # }
 ```
 
-Routes with the same RelaySession identity, source token, publisher group,
-ICE configuration, and startup deadline are prepared and joined as one
-transactional publisher. Each route keeps its own PocketStation source, stem,
-route, and bus identity.
+The two route configurations share a Relay origin, Session, credential,
+publisher group, ICE configuration, and startup deadline. They therefore
+prepare and run as one publisher while retaining distinct source, stem, route,
+and bus identities.
 
-## Operational contract
+## Configure the network path
 
-- Input is bounded 48 kHz interleaved `f32` PCM; publication is Opus over RTP.
-- One finite startup deadline covers signaling, ICE, and DTLS establishment.
-- Source credentials use Core's redacting `ConnectorSecret` value.
-- Provider failures carry stable connector codes, stages, and retryability.
-- Core owns prepare rollback, the start gate, stop, join, generic delivery
-  observations, and finalization.
-- The current transport supports finite STUN configuration. It does not
-  allocate TURN relays; networks that require TURN are unsupported in 0.1.
+```rust,no_run
+# use std::time::Duration;
+# use pocketstation::connector::ConnectorSecret;
+# use pocketstation_relay::{RelayIceServer, RelayRouteConfiguration};
+# fn config() -> Result<(), Box<dyn std::error::Error>> {
+let configuration = RelayRouteConfiguration::new(
+    "https://relay.example.com",
+    "relay-session-id",
+    ConnectorSecret::new("source-token")?,
+    "application",
+)?
+.with_publisher_group("desktop-demo")?
+.with_ice_servers([
+    RelayIceServer::new(["stun:stun.example.com:3478"])?
+])?
+.with_startup_timeout(Duration::from_secs(20))?
+.with_low_latency();
+# let _ = configuration;
+# Ok(())
+# }
+```
 
-Current evidence is component and same-host only. It does not establish remote,
-production, cross-platform or non-PocketStation-relay compatibility.
+All validation happens before media publication:
+
+- the Relay URL must be an HTTP(S) origin accepted by the transport;
+- Session, bus, and publisher-group identities are finite and non-empty;
+- credentials remain inside `ConnectorSecret` and are redacted from `Debug`;
+- ICE server and URL counts are bounded;
+- the startup deadline is between 1 ms and 120 seconds.
+
+## Runtime contract
+
+| Concern | Behavior |
+|---|---|
+| Input | bounded 48 kHz interleaved `f32` PCM |
+| Encoding | Opus outside the realtime capture callback |
+| Publication | named WebRTC streams mapped to Relay `AudioBus` identities |
+| Startup | one finite deadline across DNS, signaling, ICE, and DTLS |
+| Grouping | compatible routes share one transactional publisher |
+| Backlog | finite, latency-profile-specific freshness policy |
+| Shutdown | Core-owned drain or abort, followed by joined finalization |
+| Errors | stable connector code, provider stage, diagnostic, retryability |
+| Outcomes | per-route receipt correlated to source, stem, route, and bus |
+
+Core remains the lifecycle authority:
+
+```text
+Session prepare
+  → Connector validates and prepares provider state
+  → Core opens the start gate atomically
+  → connector workers publish bounded route input
+  → Core requests drain or abort
+  → workers join
+  → Core records terminal outcomes
+```
+
+The crate does not create a second graph, Session, queue policy, or retry
+engine. Provider retry/reconnect behavior must remain finite and explicit.
+
+## Inspect publication outcomes
+
+`RelayConnector` retains bounded publication receipts. A receipt key identifies
+the endpoint/route publication, and the final result reports stable outcome
+state and unit-bearing statistics. Missing receipts are not interpreted as
+success.
+
+Use Core's Session and route observations for generic delivery truth; use the
+connector receipt for Relay-specific publication truth.
+
+## Current boundaries
+
+- This crate targets PocketStation Relay only. LiveKit, generic WHIP, and other
+  transports require separate connectors.
+- The current ICE client configuration supports finite STUN authorities. It
+  does not allocate TURN credentials.
+- The package publishes audio; it does not implement receiver playback,
+  control-plane Session creation, or browser UI.
+- Complete PocketStation per-frame lineage is not yet serialized across the
+  remote protocol. Named bus and route correlation must not be overstated as
+  full `FrameLineage` delivery.
+- Current published evidence is component and same-host evidence, not a claim
+  of every NAT topology, cross-platform readiness, or production scale.
+
+## Verify
+
+From the repository root:
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo package -p pocketstation-relay --locked
+```
+
+Published crate versions and tags are immutable. Connector changes must retain
+Core conformance, Relay protocol compatibility, secret redaction, bounded
+startup/shutdown behavior, and isolated package-consumer proof.
