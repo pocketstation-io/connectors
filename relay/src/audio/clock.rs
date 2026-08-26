@@ -14,7 +14,7 @@
 /// lock-free. The value is always nonzero because `0` is the unset timestamp
 /// sentinel in graph accumulators.
 ///
-/// # Hot-path contract (LAW 15)
+/// # Hot-path requirements
 /// No allocation · No lock · No blocking · No logging
 #[inline]
 pub(crate) fn monotonic_ns() -> u64 {
