@@ -1,7 +1,7 @@
 # PocketStation Relay connector
 
 Publish independent PocketStation audio stems to PocketStation Relay through
-the canonical `pocketstation::connector` lifecycle.
+the `pocketstation::connector` lifecycle.
 
 `pocketstation-relay` owns the client-side Opus, RTP, WebRTC, and Relay
 signaling implementation. PocketStation Core continues to own graph
@@ -24,7 +24,12 @@ You also need a reachable
 valid RelaySession source credential. The crate never starts hidden
 infrastructure.
 
-## Publish two source-aware buses
+Before running the example, create a `RelaySession` in the control plane (or a
+standalone Relay), keep its source capability, and confirm that the Relay URL
+is reachable. The example uses placeholder values; it does not contact a
+PocketStation-operated service by default.
+
+## Declare two bus publications
 
 ```rust,no_run
 use pocketstation::connector::ConnectorSecret;
@@ -32,9 +37,12 @@ use pocketstation::{ApplicationSelector, EdgeContract, Session, Source};
 use pocketstation_relay::{RelayConnector, RelayRouteConfiguration};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
+let application_name = std::env::args()
+    .nth(1)
+    .ok_or("usage: publish_to_relay <application name or identifier>")?;
 let session = Session::builder().recording_root("recordings").build();
 let application = session.capture(Source::application(
-    ApplicationSelector::name("PocketStation Demo"),
+    ApplicationSelector::name(application_name),
 ))?;
 let microphone = session.capture(Source::microphone_default())?;
 
@@ -77,6 +85,12 @@ assert!(stop.is_success());
 # Ok(())
 # }
 ```
+
+This program demonstrates configuration, grouped preparation, Session start,
+and joined shutdown. Replace the placeholder URL, Session ID, and source
+capability before running it. A receiver-visible publication also requires the
+application and microphone to produce media while the Session remains running;
+the snippet stops immediately so it can stay focused on declaration.
 
 The two route configurations share a Relay origin, Session, credential,
 publisher group, ICE configuration, and startup deadline. They therefore
@@ -144,15 +158,15 @@ Session prepare
 The crate does not create a second graph, Session, queue policy, or retry
 engine. Provider retry/reconnect behavior must remain finite and explicit.
 
-## Inspect publication outcomes
+## Inspect publication results
 
 `RelayConnector` retains bounded publication receipts. A receipt key identifies
 the endpoint/route publication, and the final result reports stable outcome
 state and unit-bearing statistics. Missing receipts are not interpreted as
 success.
 
-Use Core's Session and route observations for generic delivery truth; use the
-connector receipt for Relay-specific publication truth.
+Use Core's Session and route observations for route delivery. Use the connector
+receipt for Relay-specific publication results.
 
 ## Current boundaries
 
