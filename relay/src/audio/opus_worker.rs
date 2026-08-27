@@ -1,6 +1,7 @@
 //! Opus encoder thread and the frame/counter types it produces.
 
 use pocketstation::codec::{OpusConfig, OpusEncodeError, OpusEncoder, OPUS_MAX_PACKET_BYTES};
+use pocketstation::OutputGeneration;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use std::time::Instant;
 use str0m::media::{Frequency, MediaTime};
@@ -27,6 +28,9 @@ pub(crate) trait EncodableFrame: Send + 'static {
     /// Monotonic nanoseconds at which the first sample of this frame was captured.
     /// Returns 0 when the source has no capture timestamp (e.g. sine generator).
     fn capture_timestamp_ns(&self) -> u64;
+    fn output_generation(&self) -> Option<OutputGeneration> {
+        None
+    }
 }
 
 /// Zero-copy bridge: `AudioFrame`'s pool-backed buffer stays alive until the
@@ -74,6 +78,10 @@ impl EncodableFrame for pocketstation::EndpointAudioFrame {
     fn channels(&self) -> u8 {
         self.channels()
     }
+
+    fn output_generation(&self) -> Option<OutputGeneration> {
+        self.output_generation().cloned()
+    }
 }
 
 /// Budget for the age of a frame at encode time: 2× the 20 ms frame period.
@@ -100,8 +108,12 @@ pub(crate) struct EncoderCounters {
     pub(crate) opus_encode_errors: AtomicU64,
     /// Frames dropped because the encoder→publisher channel was full.
     pub(crate) encoded_channel_drops: AtomicU64,
-    /// Encoded frames superseded by a fresher frame after an RTC-loop stall.
+    /// Encoded frames discarded in favor of a fresher frame after an RTC-loop stall.
     pub(crate) publisher_stale_drops: AtomicU64,
+    /// Output frames discarded after their application operation was cancelled.
+    pub(crate) cancelled_output_frames: AtomicU64,
+    /// Partial PCM samples removed when output ownership changes.
+    pub(crate) cancelled_output_samples: AtomicU64,
     /// Cumulative capture age in nanoseconds (for mean computation).
     pub(crate) capture_age_sum_ns: AtomicU64,
     /// Maximum capture age observed, in nanoseconds.
@@ -128,6 +140,7 @@ pub(crate) struct EncodedAudioFrame {
     /// 0 when `capture_timestamp_ns` is 0.
     #[allow(dead_code)]
     pub(crate) capture_age_ns: u64,
+    pub(crate) output_generation: Option<OutputGeneration>,
 }
 
 /// Delivery behavior at the bounded encoder-to-publisher boundary.
@@ -165,6 +178,16 @@ fn deliver_encoded_frame(
     delivery_policy: EncodedDeliveryPolicy,
     counters: &EncoderCounters,
 ) -> bool {
+    if encoded_frame
+        .output_generation
+        .as_ref()
+        .is_some_and(|generation| !generation.is_active())
+    {
+        counters
+            .cancelled_output_frames
+            .fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
     match delivery_policy {
         EncodedDeliveryPolicy::PreserveWithBackpressure => encoded_tx.send(encoded_frame).is_ok(),
         EncodedDeliveryPolicy::DropNewest => match encoded_tx.try_send(encoded_frame) {
@@ -201,10 +224,20 @@ impl EncoderWorker {
         &mut self,
         samples: &[f32],
         capture_timestamp_ns: u64,
+        output_generation: Option<OutputGeneration>,
         encoded_tx: &mpsc::SyncSender<EncodedAudioFrame>,
         delivery_policy: EncodedDeliveryPolicy,
         counters: &EncoderCounters,
     ) -> bool {
+        if output_generation
+            .as_ref()
+            .is_some_and(|generation| !generation.is_active())
+        {
+            counters
+                .cancelled_output_frames
+                .fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         let square_sum: f32 = samples.iter().map(|sample| sample * sample).sum();
         let sample_count = u16::try_from(samples.len()).unwrap_or(u16::MAX);
         let rms = if sample_count == 0 {
@@ -242,6 +275,7 @@ impl EncoderWorker {
             audio_level,
             capture_timestamp_ns,
             capture_age_ns,
+            output_generation,
         };
         self.rtp_sample_count = self.rtp_sample_count.saturating_add(self.rtp_step_samples);
         deliver_encoded_frame(encoded_tx, encoded_frame, delivery_policy, counters)
@@ -302,21 +336,48 @@ pub(crate) fn spawn_opus_encoder<F: EncodableFrame>(
                 counters.opus_encode_errors.fetch_add(1, Ordering::Relaxed);
                 return;
             };
+            let mut packet_output: Option<OutputGeneration> = None;
 
             while let Ok(frame) = frame_rx.recv() {
                 if frame.sample_rate_hz() != 48_000 || frame.channels() != channels {
                     counters.opus_encode_errors.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                let output_generation = frame.output_generation();
+                if output_generation
+                    .as_ref()
+                    .is_some_and(|generation| !generation.is_active())
+                {
+                    counters
+                        .cancelled_output_frames
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let output_generation_id = output_generation
+                    .as_ref()
+                    .map(|generation| generation.id().get());
                 let samples = frame.samples();
-                let Ok(discarded) = packetizer.begin_frame(frame.sequence_number(), samples.len())
-                else {
+                let Ok(boundary) = packetizer.begin_frame(
+                    frame.sequence_number(),
+                    samples.len(),
+                    output_generation_id,
+                ) else {
                     counters.opus_encode_errors.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
-                counters
-                    .normalization_partial_samples_discarded
-                    .fetch_add(discarded as u64, Ordering::Relaxed);
+                if packetizer.output_generation_id()
+                    != packet_output.as_ref().map(|value| value.id().get())
+                {
+                    packet_output = output_generation;
+                }
+                counters.normalization_partial_samples_discarded.fetch_add(
+                    boundary.discontinuity_discarded_samples as u64,
+                    Ordering::Relaxed,
+                );
+                counters.cancelled_output_samples.fetch_add(
+                    boundary.cancelled_output_discarded_samples as u64,
+                    Ordering::Relaxed,
+                );
 
                 let mut offset = 0;
                 while offset < samples.len() {
@@ -326,6 +387,7 @@ pub(crate) fn spawn_opus_encoder<F: EncodableFrame>(
                         if !worker.encode_and_deliver(
                             packet,
                             timestamp_ns,
+                            packet_output.clone(),
                             &encoded_tx,
                             delivery_policy,
                             counters.as_ref(),
@@ -345,6 +407,7 @@ pub(crate) fn spawn_opus_encoder<F: EncodableFrame>(
                     let _ = worker.encode_and_deliver(
                         packet,
                         timestamp_ns,
+                        packet_output,
                         &encoded_tx,
                         delivery_policy,
                         counters.as_ref(),
@@ -358,6 +421,24 @@ pub(crate) fn spawn_opus_encoder<F: EncodableFrame>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pocketstation::{AudioInputConfig, OutputCancelResult, SampleFormat, SampleSpec, Session};
+
+    fn output_generation() -> OutputGeneration {
+        let session = Session::builder()
+            .sample_spec(SampleSpec::new(48_000, 1, SampleFormat::F32Interleaved))
+            .build();
+        let input = session
+            .audio_input(
+                AudioInputConfig::new(
+                    SampleSpec::new(48_000, 1, SampleFormat::F32Interleaved),
+                    2,
+                    960,
+                )
+                .expect("valid output input"),
+            )
+            .expect("output input");
+        input.begin_output_generation().expect("output generation")
+    }
 
     fn encoded_frame(sequence: u8) -> EncodedAudioFrame {
         EncodedAudioFrame {
@@ -368,6 +449,7 @@ mod tests {
             audio_level: None,
             capture_timestamp_ns: 0,
             capture_age_ns: 0,
+            output_generation: None,
         }
     }
 
@@ -430,6 +512,29 @@ mod tests {
         assert_eq!(counters.encoded_channel_drops.load(Ordering::Relaxed), 1);
     }
 
+    #[test]
+    fn given_cancelled_output_when_encoded_delivery_runs_then_frame_is_discarded() {
+        let counters = EncoderCounters::default();
+        let (encoded_tx, encoded_rx) = mpsc::sync_channel(1);
+        let generation = output_generation();
+        let mut frame = encoded_frame(1);
+        frame.output_generation = Some(generation.clone());
+
+        assert_eq!(generation.cancel(), OutputCancelResult::Cancelled);
+        assert!(deliver_encoded_frame(
+            &encoded_tx,
+            frame,
+            EncodedDeliveryPolicy::PreserveWithBackpressure,
+            &counters,
+        ));
+
+        assert!(matches!(
+            encoded_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(counters.cancelled_output_frames.load(Ordering::Relaxed), 1);
+    }
+
     // Given an EncodedAudioFrame with capture_timestamp_ns == 0,
     // When capture_age_ns is read,
     // Then it is also 0 (unknown-source frames carry no age).
@@ -443,6 +548,7 @@ mod tests {
             audio_level: None,
             capture_timestamp_ns: 0,
             capture_age_ns: 0,
+            output_generation: None,
         };
         assert_eq!(frame.capture_timestamp_ns, 0);
         assert_eq!(frame.capture_age_ns, 0);
@@ -466,6 +572,7 @@ mod tests {
             audio_level: None,
             capture_timestamp_ns: capture_ts,
             capture_age_ns: age_ns,
+            output_generation: None,
         };
         assert!(
             frame.capture_age_ns > 0,

@@ -17,6 +17,12 @@ pub(crate) enum PcmPacketizerError {
     MisalignedInput { samples: usize, channels: u8 },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PcmPacketizerBegin {
+    pub(crate) discontinuity_discarded_samples: usize,
+    pub(crate) cancelled_output_discarded_samples: usize,
+}
+
 /// Bounded assembler for one 20 ms, 48 kHz mono or stereo transport packet.
 pub(crate) struct PcmPacketizer {
     samples: [f32; MAX_INTERLEAVED_SAMPLES],
@@ -25,6 +31,7 @@ pub(crate) struct PcmPacketizer {
     channels: u8,
     packet_timestamp_ns: u64,
     expected_sequence_number: Option<u64>,
+    output_generation_id: Option<u64>,
 }
 
 impl PcmPacketizer {
@@ -42,32 +49,46 @@ impl PcmPacketizer {
             channels,
             packet_timestamp_ns: 0,
             expected_sequence_number: None,
+            output_generation_id: None,
         })
     }
 
-    /// Starts one source frame and returns the number of partial samples
-    /// discarded at a sequence discontinuity.
+    /// Starts one source frame and reports any partial packet removed at its boundary.
     pub(crate) fn begin_frame(
         &mut self,
         sequence_number: u64,
         sample_count: usize,
-    ) -> Result<usize, PcmPacketizerError> {
+        output_generation_id: Option<u64>,
+    ) -> Result<PcmPacketizerBegin, PcmPacketizerError> {
         if !sample_count.is_multiple_of(usize::from(self.channels)) {
             return Err(PcmPacketizerError::MisalignedInput {
                 samples: sample_count,
                 channels: self.channels,
             });
         }
-        let discarded = if self
+        let sequence_changed = self
             .expected_sequence_number
-            .is_some_and(|expected| expected != sequence_number)
-        {
+            .is_some_and(|expected| expected != sequence_number);
+        let output_changed = self.written > 0 && self.output_generation_id != output_generation_id;
+        let discarded = if sequence_changed || output_changed {
             self.discard_partial()
         } else {
             0
         };
         self.expected_sequence_number = Some(sequence_number.saturating_add(1));
-        Ok(discarded)
+        self.output_generation_id = output_generation_id;
+        Ok(PcmPacketizerBegin {
+            discontinuity_discarded_samples: if sequence_changed && !output_changed {
+                discarded
+            } else {
+                0
+            },
+            cancelled_output_discarded_samples: if output_changed { discarded } else { 0 },
+        })
+    }
+
+    pub(crate) const fn output_generation_id(&self) -> Option<u64> {
+        self.output_generation_id
     }
 
     /// Copies as much of `input` as fits and returns the number of interleaved
@@ -151,9 +172,15 @@ mod tests {
     #[test]
     fn arbitrary_stereo_callback_widths_form_exact_twenty_millisecond_packets() {
         let mut packetizer = PcmPacketizer::new(48_000, 2).unwrap();
-        assert_eq!(packetizer.begin_frame(1, 1_024).unwrap(), 0);
+        assert_eq!(
+            packetizer.begin_frame(1, 1_024, None).unwrap(),
+            PcmPacketizerBegin::default()
+        );
         assert_eq!(packetizer.push(&[0.5; 1_024], 10, 0), 1_024);
-        assert_eq!(packetizer.begin_frame(2, 1_024).unwrap(), 0);
+        assert_eq!(
+            packetizer.begin_frame(2, 1_024, None).unwrap(),
+            PcmPacketizerBegin::default()
+        );
         assert_eq!(packetizer.push(&[0.25; 1_024], 20, 0), 896);
         assert_eq!(packetizer.complete_packet().unwrap().0.len(), 1_920);
     }
@@ -161,8 +188,30 @@ mod tests {
     #[test]
     fn discontinuity_discards_only_the_bounded_partial_packet() {
         let mut packetizer = PcmPacketizer::new(48_000, 1).unwrap();
-        packetizer.begin_frame(7, 480).unwrap();
+        packetizer.begin_frame(7, 480, None).unwrap();
         packetizer.push(&[0.0; 480], 10, 0);
-        assert_eq!(packetizer.begin_frame(9, 480).unwrap(), 480);
+        assert_eq!(
+            packetizer.begin_frame(9, 480, None).unwrap(),
+            PcmPacketizerBegin {
+                discontinuity_discarded_samples: 480,
+                cancelled_output_discarded_samples: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn given_partial_packet_when_output_changes_then_old_samples_are_discarded() {
+        let mut packetizer = PcmPacketizer::new(48_000, 1).unwrap();
+        packetizer.begin_frame(7, 480, Some(1)).unwrap();
+        packetizer.push(&[0.0; 480], 10, 0);
+
+        assert_eq!(
+            packetizer.begin_frame(8, 480, Some(2)).unwrap(),
+            PcmPacketizerBegin {
+                discontinuity_discarded_samples: 0,
+                cancelled_output_discarded_samples: 480,
+            }
+        );
+        assert_eq!(packetizer.output_generation_id(), Some(2));
     }
 }

@@ -222,6 +222,19 @@ pub(crate) fn run_publish_loop(
                             .publisher_stale_drops
                             .fetch_add(stale_drops, Ordering::Relaxed);
                     }
+                    if frame
+                        .output_generation
+                        .as_ref()
+                        .is_some_and(|generation| !generation.is_active())
+                    {
+                        streams[index]
+                            .stream
+                            .counters
+                            .cancelled_output_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                        round_robin_start = (index + 1) % streams.len();
+                        continue 'publish;
+                    }
                     let mid = streams[index].stream.mid;
                     let payload_type = streams[index].payload_type;
                     let payload_bytes = frame.payload.len() as u64;
@@ -313,6 +326,7 @@ mod tests {
             audio_level: None,
             capture_timestamp_ns: 0,
             capture_age_ns: 0,
+            output_generation: None,
         }
     }
 

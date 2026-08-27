@@ -44,6 +44,8 @@ pub struct RelayPublishStatistics {
     pub encoder_channel_drops_total: u64,
     pub publisher_stale_drops_total: u64,
     pub ingress_queue_drops_total: u64,
+    pub cancelled_output_frames_total: u64,
+    pub cancelled_output_samples_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -770,6 +772,8 @@ fn statistics(
         encoder_channel_drops_total: counters.encoded_channel_drops.load(Ordering::Relaxed),
         publisher_stale_drops_total: counters.publisher_stale_drops.load(Ordering::Relaxed),
         ingress_queue_drops_total: state.ingress_queue_drops_total.load(Ordering::Relaxed),
+        cancelled_output_frames_total: counters.cancelled_output_frames.load(Ordering::Relaxed),
+        cancelled_output_samples_total: counters.cancelled_output_samples.load(Ordering::Relaxed),
     }
 }
 
