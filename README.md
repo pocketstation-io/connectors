@@ -21,6 +21,8 @@ cargo add pocketstation pocketstation-relay
 Then follow the [Relay connector guide](relay/README.md) to publish application
 and microphone audio as separate buses.
 
+See the [release notes](relay/RELEASE_NOTES.md) before upgrading.
+
 ## What the Relay connector handles
 
 The package owns the Relay-specific work:
