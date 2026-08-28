@@ -9,7 +9,13 @@ readme = "README.md"
 description = "Bounded WebRTC relay publishing connector for PocketStation"
 keywords = ["audio", "realtime", "relay", "webrtc", "pocketstation"]
 categories = ["multimedia::audio", "network-programming"]
-include = ["/Cargo.toml", "/README.md", "/src/**", "/tests/**"]
+include = [
+  "/Cargo.toml",
+  "/README.md",
+  "/RELEASE_NOTES.md",
+  "/src/**",
+  "/tests/**",
+]
 
 [package.metadata.docs.rs]
 default-target = "x86_64-unknown-linux-gnu"
