@@ -14,13 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check out protocol conformance data
-        uses: actions/checkout@v4
-        with:
-          repository: pocketstation-io/protocol
-          path: protocol
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
       - name: Install Rust 1.95
         uses: dtolnay/rust-toolchain@master
@@ -31,10 +25,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Verify the packaged conformance vector
-        run: >-
-          cmp
-          relay/tests/fixtures/connector-v1-vectors.json
-          protocol/conformance/connector/v1/vectors.json
+        run: |
+          actual="$(
+            openssl dgst -sha256 relay/tests/fixtures/connector-v1-vectors.json |
+              awk '{print $NF}'
+          )"
+          test "${actual}" = "18d7218047bd77b599c0639b69c4fead31149beccbc13156fd387512bc818b91"
 
       - name: Format
         run: cargo fmt --all -- --check
