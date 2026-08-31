@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-const VECTORS: &str = include_str!("../../../protocol/conformance/connector/v1/vectors.json");
+const VECTORS: &str = include_str!("fixtures/connector-v1-vectors.json");
 
 fn positive(value: Option<&Value>) -> bool {
     value.and_then(Value::as_u64).is_some_and(|value| value > 0)
