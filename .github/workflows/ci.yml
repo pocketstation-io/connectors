@@ -32,6 +32,15 @@ jobs:
           )"
           test "${actual}" = "18d7218047bd77b599c0639b69c4fead31149beccbc13156fd387512bc818b91"
 
+      - name: Public documentation language
+        run: |
+          if rg -n -i '\b(boundary|path|surface|authority|projection|lowering|flow|layer)\b' \
+            README.md relay \
+            --glob '*.md' --glob '*.mdx'; then
+            echo "Public documentation must name the API, queue, process, service, or request directly."
+            exit 1
+          fi
+
       - name: Format
         run: cargo fmt --all -- --check
 
