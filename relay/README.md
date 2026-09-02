@@ -97,7 +97,7 @@ publisher group, ICE configuration, and startup deadline. They therefore
 prepare and run as one publisher while retaining distinct source, stem, route,
 and bus identities.
 
-## Configure the network path
+## Configure the Relay connection
 
 ```rust,no_run
 # use std::time::Duration;
@@ -143,7 +143,7 @@ All validation happens before media publication:
 | Errors | stable connector code, provider stage, diagnostic, retryability |
 | Outcomes | per-route receipt correlated to source, stem, route, and bus |
 
-Core remains the lifecycle authority:
+Core controls the Connector lifecycle:
 
 ```text
 Session prepare

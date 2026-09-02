@@ -15,7 +15,7 @@ This release requires `pocketstation 1.1.3`, which introduced output generation
 ownership for application-provided audio.
 
 Cancellation cannot recall RTP packets already sent to Relay or audio already
-buffered by a receiver. A complete interruption path must also clear receiver
+buffered by a receiver. Complete interruption handling must also clear receiver
 playout when that receiver provides the capability.
 
 ### Upgrade
