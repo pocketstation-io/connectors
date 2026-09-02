@@ -129,7 +129,7 @@ All validation happens before media publication:
 - ICE server and URL counts are bounded;
 - the startup deadline is between 1 ms and 120 seconds.
 
-## Runtime contract
+## Runtime behavior
 
 | Concern | Behavior |
 |---|---|

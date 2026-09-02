@@ -34,7 +34,7 @@ jobs:
 
       - name: Public documentation language
         run: |
-          if rg -n -i '\b(boundary|path|surface|authority|projection|lowering|flow|layer)\b' \
+          if rg -n -i '\b(boundary|path|surface|authority|projection|lowering|flow|layer|contracts?)\b' \
             README.md relay \
             --glob '*.md' --glob '*.mdx'; then
             echo "Public documentation must name the API, queue, process, service, or request directly."
