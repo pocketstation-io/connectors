@@ -5,7 +5,7 @@ the `pocketstation::connector` lifecycle.
 
 `pocketstation-relay` owns the client-side Opus, RTP, WebRTC, and Relay
 signaling implementation. PocketStation Core continues to own graph
-compilation, bounded delivery, lineage, recording, and transactional lifecycle.
+compilation, route delivery, lineage, recording, and transactional lifecycle.
 
 ```text
 application stem ──→ application AudioBus ──┐
@@ -33,7 +33,7 @@ PocketStation-operated service by default.
 
 ```rust,no_run
 use pocketstation::connector::ConnectorSecret;
-use pocketstation::{ApplicationSelector, EdgeContract, Session, Source};
+use pocketstation::{ApplicationSelector, RouteSettings, Session, Source};
 use pocketstation_relay::{RelayConnector, RelayRouteConfiguration};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,7 +59,7 @@ let application_endpoint = registered.declare(
         "application",
     )?
     .connector_configuration()?,
-    EdgeContract::realtime_audio(),
+    RouteSettings::realtime_audio(),
 )?;
 
 let microphone_endpoint = registered.declare(
@@ -71,7 +71,7 @@ let microphone_endpoint = registered.declare(
         "microphone",
     )?
     .connector_configuration()?,
-    EdgeContract::realtime_audio(),
+    RouteSettings::realtime_audio(),
 )?;
 
 application.send(application_endpoint)?;
@@ -126,14 +126,14 @@ All validation happens before media publication:
 - the Relay URL must be an HTTP(S) origin accepted by the transport;
 - Session, bus, and publisher-group identities are finite and non-empty;
 - credentials remain inside `ConnectorSecret` and are redacted from `Debug`;
-- ICE server and URL counts are bounded;
+- ICE server and URL counts must remain within their configured maxima;
 - the startup deadline is between 1 ms and 120 seconds.
 
-## Runtime contract
+## Runtime behavior
 
 | Concern | Behavior |
 |---|---|
-| Input | bounded 48 kHz interleaved `f32` PCM |
+| Input | 48 kHz interleaved `f32` PCM through a fixed-capacity route queue |
 | Encoding | Opus outside the realtime capture callback |
 | Publication | named WebRTC streams mapped to Relay `AudioBus` identities |
 | Startup | one finite deadline across DNS, signaling, ICE, and DTLS |
@@ -149,7 +149,7 @@ Core controls the Connector lifecycle:
 Session prepare
   → Connector validates and prepares provider state
   → Core opens the start gate atomically
-  → connector workers publish bounded route input
+  → connector workers publish accepted route input
   → Core requests drain or abort
   → workers join
   → Core records terminal outcomes
@@ -160,7 +160,7 @@ engine. Provider retry/reconnect behavior must remain finite and explicit.
 
 ## Inspect publication results
 
-`RelayConnector` retains bounded publication receipts. A receipt key identifies
+`RelayConnector` retains receipts up to its configured capacity. A receipt key identifies
 the endpoint/route publication, and the final result reports stable outcome
 state and unit-bearing statistics. Missing receipts are not interpreted as
 success.
@@ -195,5 +195,5 @@ cargo package -p pocketstation-relay --locked
 ```
 
 Published crate versions and tags are immutable. Connector changes must retain
-Core conformance, Relay protocol compatibility, secret redaction, bounded
-startup/shutdown behavior, and isolated package-consumer proof.
+Core conformance, Relay protocol compatibility, secret redaction, startup and
+shutdown deadlines, and isolated package-consumer proof.

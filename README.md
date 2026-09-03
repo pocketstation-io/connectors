@@ -33,8 +33,8 @@ The package owns the Relay-specific work:
 - finite startup and shutdown deadlines;
 - redacted credentials and structured failures.
 
-PocketStation Core continues to own capture, graph compilation, bounded
-routing, recording, and Session lifecycle.
+PocketStation Core continues to own capture, graph compilation, route queues,
+recording, and Session lifecycle.
 
 ## Current limits
 

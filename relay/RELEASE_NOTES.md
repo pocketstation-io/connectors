@@ -1,5 +1,15 @@
 # PocketStation Relay connector release notes
 
+## 0.1.3 — Clear route settings
+
+Relay destinations now use the route settings and execution safety names from
+PocketStation 1.1.6. Audio delivery, named bus publication, cancellation, and
+shutdown behavior are unchanged.
+
+```console
+cargo update -p pocketstation -p pocketstation-relay
+```
+
 ## 0.1.2 — Stop cancelled output before Relay sends it
 
 When a person interrupts generated speech, stopping the provider task is not

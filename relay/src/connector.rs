@@ -8,8 +8,8 @@ use pocketstation::connector::{
     ConnectorRegistrationError, ConnectorRequirement, RegisteredConnector,
 };
 use pocketstation::graph::{
-    AudioCaps, ChannelLayout, ExecutionPartition, MediaCaps, Multiplicity, NodeDescriptor,
-    NodeTypeId, PortDirection, PortSpec, SafetyContract, SignalSpec,
+    AudioCaps, ChannelLayout, ExecutionPartition, ExecutionSafety, MediaCaps, Multiplicity,
+    NodeDescriptor, NodeTypeId, PortDirection, PortSpec, SignalSpec,
 };
 use pocketstation::{OperatorId, SampleFormat, Session};
 
@@ -122,7 +122,7 @@ pub fn relay_connector_manifest() -> Result<ConnectorManifest, RelayConnectorBui
         vec![input],
         Vec::new(),
         ExecutionPartition::AsyncWorker,
-        SafetyContract::NetworkAllowed,
+        ExecutionSafety::NetworkAllowed,
         true,
     )
     .map_err(|error| RelayConnectorBuildError::GraphContract(error.to_string()))?;
