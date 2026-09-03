@@ -945,7 +945,7 @@ mod tests {
             .declare(
                 session,
                 configuration,
-                pocketstation::EdgeContract::realtime_audio(),
+                pocketstation::RouteSettings::realtime_audio(),
             )
             .expect("relay endpoint declaration")
     }
