@@ -1,12 +1,12 @@
 [package]
 name = "pocketstation-relay"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-description = "Bounded WebRTC relay publishing connector for PocketStation"
+description = "Publish PocketStation AudioBuses to remote WebRTC receivers"
 keywords = ["audio", "realtime", "relay", "webrtc", "pocketstation"]
 categories = ["multimedia::audio", "network-programming"]
 include = [
