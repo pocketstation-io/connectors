@@ -1,5 +1,16 @@
 # PocketStation Relay connector release notes
 
+## 0.1.4 — Accurate route depth observations
+
+This release uses PocketStation Core 1.1.7, which prevents concurrent route
+metrics from reporting a queue depth above its configured capacity. Relay
+publication, named AudioBuses, output cancellation, and shutdown behavior are
+unchanged.
+
+```console
+cargo update -p pocketstation -p pocketstation-relay
+```
+
 ## 0.1.3 — Clear route settings
 
 Relay destinations now use the route settings and execution safety names from
