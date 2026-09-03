@@ -36,7 +36,7 @@ jobs:
         run: |
           if rg -n -i '\b(boundary|path|surface|authority|projection|lowering|flow|layer|bounded|contracts?)\b' \
             README.md relay \
-            --glob '*.md' --glob '*.mdx'; then
+            --glob '*.md' --glob '*.mdx' --glob '*.toml'; then
             echo "Public documentation must name the API, queue, limit, process, service, or request directly."
             exit 1
           fi

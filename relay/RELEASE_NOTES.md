@@ -1,5 +1,14 @@
 # PocketStation Relay connector release notes
 
+## 0.1.5 — Clear package description
+
+The package description now states that the Connector publishes PocketStation
+AudioBuses to remote WebRTC receivers. Runtime behavior is unchanged.
+
+```console
+cargo update -p pocketstation-relay
+```
+
 ## 0.1.4 — Accurate route depth observations
 
 This release uses PocketStation Core 1.1.7, which prevents concurrent route
