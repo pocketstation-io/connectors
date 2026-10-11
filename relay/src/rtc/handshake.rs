@@ -1,7 +1,7 @@
 //! Shared ICE/DTLS handshake performed by every source type.
 
 use std::fmt::Write as _;
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,12 +9,11 @@ use str0m::change::SdpAnswer;
 use str0m::media::{Direction, MediaKind, Mid};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, Input, Output, Rtc};
-use url::Url;
 
 use crate::configuration::RelayIceServer;
 use crate::rtc::signaling::{
     send_leave, wait_for_sdp_answer, ws_set_read_timeout, ws_set_write_timeout, PublishBusBinding,
-    PublishMsg, ServerMsg, Ws, WS_POLL_TIMEOUT, WS_WRITE_TIMEOUT,
+    PublishMsg, ServerMsg, SubscribeMsg, Ws, WS_POLL_TIMEOUT, WS_WRITE_TIMEOUT,
 };
 use crate::rtc::types::drain_all_outputs;
 
@@ -235,49 +234,13 @@ fn probe_srflx_inner(
 
 fn connect_signaling(
     ws_url: &str,
+    proxy: Option<&pocketstation::connector::ConnectorSecret>,
     deadline: Instant,
-) -> Result<(Ws, tungstenite::handshake::client::Response), Box<dyn std::error::Error>> {
-    let url = Url::parse(ws_url)?;
-    let host = url.host_str().ok_or("relay signaling URL has no host")?;
-    let port = url
-        .port_or_known_default()
-        .ok_or("relay signaling URL has no usable port")?;
-    let authority = if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-    let addresses = resolve_before_deadline(authority, deadline)?;
-    if addresses.is_empty() {
-        return Err("relay signaling host resolved to no addresses".into());
-    }
-
-    let mut last_error = None;
-    for address in addresses {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
-        match TcpStream::connect_timeout(&address, remaining) {
-            Ok(stream) => {
-                stream.set_nodelay(true)?;
-                stream.set_read_timeout(Some(remaining))?;
-                stream.set_write_timeout(Some(remaining))?;
-                return tungstenite::client_tls(ws_url, stream)
-                    .map_err(|error| format!("relay signaling handshake failed: {error}").into());
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    Err(last_error
-        .map_or_else(
-            || "relay signaling connection exceeded its startup deadline".to_owned(),
-            |error| format!("relay signaling connection failed: {error}"),
-        )
-        .into())
+) -> Result<Ws, Box<dyn std::error::Error>> {
+    crate::rtc::proxy::connect(ws_url, proxy, None, None, deadline)
 }
 
-fn resolve_before_deadline(
+pub(crate) fn resolve_before_deadline(
     authority: String,
     deadline: Instant,
 ) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
@@ -349,6 +312,7 @@ pub(crate) fn run_handshake(
     token: &str,
     media: &[PublishMedia],
     ice_servers: &[RelayIceServer],
+    proxy: Option<&pocketstation::connector::ConnectorSecret>,
     startup_timeout: Duration,
 ) -> Result<HandshakeResult, Box<dyn std::error::Error>> {
     if media.is_empty() {
@@ -429,7 +393,7 @@ pub(crate) fn run_handshake(
         .replacen("http://", "ws://", 1);
     let ws_url = format!("{ws_base}/v1/signal");
 
-    let (mut ws, _) = connect_signaling(&ws_url, startup_deadline)?;
+    let mut ws = connect_signaling(&ws_url, proxy, startup_deadline)?;
 
     // 5. Send PUBLISH with SDP offer. The bus label travels in the signaling
     //    bus_id field (what the relay routes on), not just the SDP msid.
@@ -569,6 +533,191 @@ pub(crate) fn run_handshake(
         rtc,
         ws,
         mids,
+        bound_addr,
+        udp,
+    })
+}
+
+/// Establish one authenticated receive-only WebRTC subscription for an exact
+/// Relay `AudioBus`.
+///
+/// This deliberately uses the Relay's existing TLS-capable signaling path so
+/// the connector can share the same finite DNS, socket, ICE, and DTLS budgets
+/// as publication. Relay also exposes WHEP as its standards-facing HTTP
+/// boundary; Core remains unaware of either signaling protocol.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn run_subscriber_handshake(
+    relay_url: &str,
+    session_id: &str,
+    bus_id: &str,
+    token: &str,
+    ice_servers: &[RelayIceServer],
+    startup_timeout: Duration,
+) -> Result<HandshakeResult, Box<dyn std::error::Error>> {
+    let startup_deadline = Instant::now()
+        .checked_add(startup_timeout)
+        .ok_or("relay subscriber startup deadline overflow")?;
+    let udp = UdpSocket::bind("0.0.0.0:0")?;
+    udp.set_read_timeout(Some(Duration::from_millis(UDP_READ_TIMEOUT_MS)))?;
+    let bound_port = udp.local_addr()?.port();
+    let candidate_ip = probe_local_ip(relay_url, startup_deadline)?;
+    let bound_addr = SocketAddr::new(candidate_ip, bound_port);
+
+    let now = Instant::now();
+    let mut rtc = Rtc::builder().clear_codecs().enable_opus(true).build(now);
+    let local_candidate = Candidate::host(bound_addr, "udp")
+        .map_err(|error| format!("failed to create subscriber ICE host candidate: {error:?}"))?;
+    rtc.add_local_candidate(local_candidate);
+    if let Some(srflx_addr) = probe_srflx(&udp, bound_addr, ice_servers, startup_deadline) {
+        if srflx_addr != bound_addr {
+            if let Ok(candidate) = Candidate::server_reflexive(srflx_addr, bound_addr, "udp") {
+                rtc.add_local_candidate(candidate);
+            }
+        }
+    }
+
+    let mut change = rtc.sdp_api();
+    let mid = change.add_media(
+        MediaKind::Audio,
+        Direction::RecvOnly,
+        Some(bus_id.to_owned()),
+        Some(bus_id.to_owned()),
+        None,
+    );
+    let (offer, pending) = change
+        .apply()
+        .ok_or("SDP apply returned None for the receive-only Relay AudioBus")?;
+    let offer_sdp = munge_opus_params(&offer.to_sdp_string(), false, 64 * SDP_BITS_PER_KBPS);
+
+    let ws_base = relay_url
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1);
+    let ws_url = format!("{ws_base}/v1/signal");
+    let mut ws = connect_signaling(&ws_url, None, startup_deadline)?;
+    let subscribe = SubscribeMsg {
+        msg_type: "SUBSCRIBE",
+        room_id: session_id,
+        token,
+        sdp_offer: &offer_sdp,
+        bus_id,
+    };
+    ws.send(tungstenite::Message::Text(
+        serde_json::to_string(&subscribe)?.into(),
+    ))?;
+
+    let remaining = startup_deadline
+        .checked_duration_since(Instant::now())
+        .ok_or("relay subscriber timed out before the SDP answer")?;
+    ws_set_read_timeout(&ws, Some(remaining))?;
+    ws_set_write_timeout(&ws, Some(remaining))?;
+    let signaling_answer = wait_for_sdp_answer(&mut ws, session_id)?;
+    let sdp_answer = SdpAnswer::from_sdp_string(&signaling_answer.sdp_answer)
+        .map_err(|error| format!("failed to parse subscriber SDP answer: {error:?}"))?;
+    rtc.sdp_api()
+        .accept_answer(pending, sdp_answer)
+        .map_err(|error| format!("subscriber accept_answer failed: {error:?}"))?;
+    for candidate_sdp in signaling_answer.early_candidates {
+        let candidate = Candidate::from_sdp_string(&candidate_sdp)
+            .map_err(|error| format!("invalid buffered Relay ICE candidate: {error:?}"))?;
+        rtc.add_remote_candidate(candidate);
+    }
+    let _ = drain_all_outputs(&mut rtc, &udp)?;
+
+    ws_set_read_timeout(&ws, Some(WS_POLL_TIMEOUT))?;
+    let mut connected = false;
+    let mut udp_buf = [0u8; 2048];
+    'handshake: while Instant::now() < startup_deadline {
+        match rtc
+            .poll_output()
+            .map_err(|error| format!("subscriber poll_output: {error:?}"))?
+        {
+            Output::Transmit(transmit) => {
+                if let Err(error) = udp.send_to(&transmit.contents, transmit.destination) {
+                    if error.kind() != std::io::ErrorKind::WouldBlock {
+                        return Err(error.into());
+                    }
+                }
+            }
+            Output::Event(Event::Connected) => {
+                connected = true;
+                break 'handshake;
+            }
+            Output::Event(_) => {}
+            Output::Timeout(next_timeout) => {
+                // `poll_output()` reached the drain boundary. Perform at most
+                // one RTC mutation in this branch, then return to polling so
+                // str0m is fully drained before another mutation.
+                match udp.recv_from(&mut udp_buf) {
+                    Ok((size, source)) => {
+                        let receive =
+                            Receive::new(Protocol::Udp, source, bound_addr, &udp_buf[..size])
+                                .map_err(|error| {
+                                    format!("subscriber Receive::new failed: {error:?}")
+                                })?;
+                        rtc.handle_input(Input::Receive(Instant::now(), receive))
+                            .map_err(|error| format!("subscriber UDP input failed: {error:?}"))?;
+                        continue 'handshake;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                match ws.read() {
+                    Ok(tungstenite::Message::Text(text)) => {
+                        if let Ok(message) = serde_json::from_str::<ServerMsg>(&text) {
+                            if message.msg_type == "ICE" && !message.candidate.is_empty() {
+                                let candidate = Candidate::from_sdp_string(&message.candidate)
+                                    .map_err(|error| {
+                                        format!("invalid Relay ICE candidate: {error:?}")
+                                    })?;
+                                rtc.add_remote_candidate(candidate);
+                                continue 'handshake;
+                            } else if message.msg_type == "ERROR" {
+                                return Err(format!(
+                                    "relay error {}: {}",
+                                    message.code, message.message
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    Ok(tungstenite::Message::Close(_)) => {
+                        return Err("relay closed subscriber signaling during startup".into());
+                    }
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => {
+                        return Err(format!("relay subscriber signaling failed: {error}").into());
+                    }
+                }
+                if Instant::now() >= next_timeout {
+                    rtc.handle_input(Input::Timeout(Instant::now()))
+                        .map_err(|error| format!("subscriber timeout input failed: {error:?}"))?;
+                }
+            }
+        }
+    }
+    if !connected {
+        let _ = send_leave(&mut ws, session_id);
+        return Err(format!(
+            "subscriber ICE/DTLS handshake exceeded the configured {} ms startup deadline",
+            startup_timeout.as_millis()
+        )
+        .into());
+    }
+    ws_set_read_timeout(&ws, Some(WS_POLL_TIMEOUT))?;
+    ws_set_write_timeout(&ws, Some(WS_WRITE_TIMEOUT))?;
+    Ok(HandshakeResult {
+        rtc,
+        ws,
+        mids: vec![mid],
         bound_addr,
         udp,
     })

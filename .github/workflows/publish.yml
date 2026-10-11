@@ -13,6 +13,12 @@ on:
 permissions:
   contents: read
 
+env:
+  PKS_RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+  PKS_RELEASE_EVENT: ${{ github.event_name }}
+  PKS_RELEASE_CONTROLLER_REF: ${{ github.ref }}
+  PKS_RELEASE_CONTROLLER_SHA: ${{ github.sha }}
+
 concurrency:
   group: crates-io-publish
   cancel-in-progress: false
@@ -31,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.release_tag }}
           fetch-depth: 0
 
       - name: Install Rust 1.95
@@ -39,31 +46,8 @@ jobs:
           toolchain: 1.95.0
           components: clippy, rustfmt
 
-      - name: Validate the release tag
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
-        run: |
-          set -euo pipefail
-          version="$(
-            cargo metadata --format-version 1 --no-deps |
-              jq -r '.packages[] | select(.name == "pocketstation-relay") | .version'
-          )"
-          expected_tag="pocketstation-relay-v${version}"
-          if [[ "${RELEASE_TAG}" != "${expected_tag}" ]]; then
-            echo "release tag ${RELEASE_TAG} must equal ${expected_tag}" >&2
-            exit 1
-          fi
-          tag_commit="$(git rev-list -n 1 "${RELEASE_TAG}")"
-          git fetch origin main
-          if ! git merge-base --is-ancestor "${tag_commit}" origin/main; then
-            echo "release commit is not contained in origin/main" >&2
-            exit 1
-          fi
-          if [[ "${EVENT_NAME}" == "release" && "${tag_commit}" != "${GITHUB_SHA}" ]]; then
-            echo "release tag does not resolve to the checked-out commit" >&2
-            exit 1
-          fi
+      - name: Bind selected tag source and workflow controller
+        run: bash scripts/publish-relay.sh --check-source
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
@@ -78,7 +62,8 @@ jobs:
           cargo test --workspace --all-features --locked
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
           RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --all-features --locked
-          cargo publish --manifest-path relay/Cargo.toml --dry-run --locked
+          bash scripts/publish-relay.sh --dry-run
+          bash scripts/test-publish-relay-recovery.sh
 
   publish:
     needs: validate
@@ -87,24 +72,18 @@ jobs:
     environment: crates-io
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.release_tag }}
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: 1.95.0
 
+      - name: Bind selected tag source and workflow controller
+        run: bash scripts/publish-relay.sh --check-source
+
       - name: Publish pocketstation-relay
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          set -euo pipefail
-          version="$(
-            cargo metadata --format-version 1 --no-deps |
-              jq -r '.packages[] | select(.name == "pocketstation-relay") | .version'
-          )"
-          if curl --fail --silent --show-error \
-            "https://crates.io/api/v1/crates/pocketstation-relay/${version}" \
-            >/dev/null; then
-            echo "pocketstation-relay ${version} is already published"
-            exit 0
-          fi
-          cargo publish --manifest-path relay/Cargo.toml --locked
+        run: bash scripts/publish-relay.sh

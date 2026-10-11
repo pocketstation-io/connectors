@@ -53,6 +53,21 @@ impl RelayConnector {
         })
     }
 
+    /// Creates a connector for one explicitly renewable WebSocket publisher.
+    ///
+    /// # Errors
+    /// Returns an error when the connector contract or initial capability is invalid.
+    pub fn with_publisher_control(
+        control: crate::RelayPublisherControl,
+    ) -> Result<Self, RelayConnectorBuildError> {
+        Ok(Self {
+            factory: Arc::new(RelayConnectorFactory::with_publisher_control(
+                DEFAULT_RECEIPT_CAPACITY,
+                control,
+            )?),
+        })
+    }
+
     /// Builds the SDK-neutral Core connector value.
     ///
     /// # Errors
@@ -180,6 +195,18 @@ pub fn relay_connector_manifest() -> Result<ConnectorManifest, RelayConnectorBui
                 minimum: 1,
                 maximum: MAX_STARTUP_TIMEOUT_MS,
             }),
+            ConnectorConfigurationField::new(
+                crate::configuration::TRANSPORT_KEY,
+                ConnectorConfigurationValueKind::Text,
+                ConnectorConfigurationRequirement::Default(ConnectorConfigurationValue::Text("webrtc".to_owned())),
+                "Explicit media protocol: WebRTC/UDP or authenticated WebSocket Opus ingress.",
+            ).with_constraint(ConnectorConfigurationConstraint::OneOf(vec!["webrtc".to_owned(), "websocket".to_owned()])),
+            ConnectorConfigurationField::new(
+                crate::configuration::HTTP_PROXY_KEY,
+                ConnectorConfigurationValueKind::Secret,
+                ConnectorConfigurationRequirement::Optional,
+                "HTTP CONNECT proxy origin; credentials are redacted. No direct fallback.",
+            ).with_constraint(ConnectorConfigurationConstraint::NonEmpty),
         ],
     )?;
     let manifest = ConnectorManifest::new(
@@ -205,8 +232,8 @@ pub fn relay_connector_manifest() -> Result<ConnectorManifest, RelayConnectorBui
     )?)
     .with_requirement(ConnectorRequirement::new(
         "network.udp",
-        true,
-        "Requires UDP reachability to the selected Relay media plane.",
+        false,
+        "WebRTC media requires UDP. WebSocket ingress uses TCP/TLS through the configured proxy.",
     )?)
     .with_requirement(ConnectorRequirement::new(
         "network.turn-not-supported",

@@ -23,6 +23,31 @@ pub(crate) const PUBLISHER_GROUP_ID_KEY: &str = "publisher_group_id";
 pub(crate) const LATENCY_PROFILE_KEY: &str = "latency_profile";
 pub(crate) const ICE_SERVERS_KEY: &str = "ice_servers";
 pub(crate) const STARTUP_TIMEOUT_MS_KEY: &str = "startup_timeout_ms";
+pub(crate) const TRANSPORT_KEY: &str = "transport";
+pub(crate) const HTTP_PROXY_KEY: &str = "http_proxy";
+
+/// The client media protocol selected for an existing Relay publisher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayPublicationTransport {
+    WebRtc,
+    WebSocket,
+}
+
+impl RelayPublicationTransport {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::WebRtc => "webrtc",
+            Self::WebSocket => "websocket",
+        }
+    }
+    fn parse(value: &str) -> Result<Self, RelayConfigurationError> {
+        match value {
+            "webrtc" => Ok(Self::WebRtc),
+            "websocket" => Ok(Self::WebSocket),
+            _ => Err(RelayConfigurationError::InvalidTransport),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayLatencyProfile {
@@ -129,6 +154,8 @@ pub struct RelayRouteConfiguration {
     pub(crate) latency_profile: RelayLatencyProfile,
     pub(crate) ice_servers: Vec<RelayIceServer>,
     pub(crate) startup_timeout: Duration,
+    pub(crate) transport: RelayPublicationTransport,
+    pub(crate) http_proxy: Option<ConnectorSecret>,
 }
 
 impl std::fmt::Debug for RelayRouteConfiguration {
@@ -143,6 +170,11 @@ impl std::fmt::Debug for RelayRouteConfiguration {
             .field("latency_profile", &self.latency_profile)
             .field("ice_servers", &self.ice_servers)
             .field("startup_timeout", &self.startup_timeout)
+            .field("transport", &self.transport)
+            .field(
+                "http_proxy",
+                &self.http_proxy.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -170,6 +202,8 @@ impl RelayRouteConfiguration {
             latency_profile: RelayLatencyProfile::Standard,
             ice_servers: Vec::new(),
             startup_timeout: Duration::from_millis(DEFAULT_STARTUP_TIMEOUT_MS),
+            transport: RelayPublicationTransport::WebRtc,
+            http_proxy: None,
         };
         configuration.validate()?;
         Ok(configuration)
@@ -199,6 +233,36 @@ impl RelayRouteConfiguration {
         ice_servers: impl IntoIterator<Item = RelayIceServer>,
     ) -> Result<Self, RelayConfigurationError> {
         self.ice_servers = ice_servers.into_iter().collect();
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Publishes Opus over authenticated WebSocket ingress without publisher UDP.
+    ///
+    /// # Errors
+    /// Returns an error if the Relay origin would expose the source capability
+    /// over plaintext outside loopback.
+    pub fn with_websocket_ingress(mut self) -> Result<Self, RelayConfigurationError> {
+        self.transport = RelayPublicationTransport::WebSocket;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Selects an HTTP or HTTPS CONNECT proxy. Proxy credentials remain secret.
+    /// HTTPS verifies the proxy certificate and hostname independently of Relay TLS.
+    ///
+    /// When omitted, WebSocket connections honor `HTTPS_PROXY`/`https_proxy`,
+    /// `ALL_PROXY`/`all_proxy` and `NO_PROXY`/`no_proxy`. Failure never falls back direct.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or unsupported proxy protocols.
+    pub fn with_http_proxy(
+        mut self,
+        proxy: ConnectorSecret,
+    ) -> Result<Self, RelayConfigurationError> {
+        crate::rtc::proxy::checked_proxy(proxy.expose_secret())
+            .map_err(|_| RelayConfigurationError::InvalidProxy)?;
+        self.http_proxy = Some(proxy);
         self.validate()?;
         Ok(self)
     }
@@ -240,6 +304,8 @@ impl RelayRouteConfiguration {
             && self.publisher_group_id == other.publisher_group_id
             && self.ice_servers == other.ice_servers
             && self.startup_timeout == other.startup_timeout
+            && self.transport == other.transport
+            && self.http_proxy == other.http_proxy
     }
 
     /// Converts this typed value into Core's secret-aware connector configuration.
@@ -282,7 +348,17 @@ impl RelayRouteConfiguration {
                     u64::try_from(self.startup_timeout.as_millis())
                         .map_err(|_| RelayConfigurationError::InvalidStartupTimeout)?,
                 ),
+            )
+            .with(
+                TRANSPORT_KEY,
+                ConnectorConfigurationValue::Text(self.transport.as_str().to_owned()),
             );
+        if let Some(proxy) = &self.http_proxy {
+            configuration.insert(
+                HTTP_PROXY_KEY,
+                ConnectorConfigurationValue::Secret(proxy.clone()),
+            );
+        }
         if !self.ice_servers.is_empty() {
             configuration.insert(
                 ICE_SERVERS_KEY,
@@ -317,6 +393,15 @@ impl RelayRouteConfiguration {
             )?,
             ice_servers,
             startup_timeout: Duration::from_millis(startup_timeout_ms),
+            transport: RelayPublicationTransport::parse(
+                configuration.get(TRANSPORT_KEY).unwrap_or("webrtc"),
+            )?,
+            http_proxy: configuration
+                .get(HTTP_PROXY_KEY)
+                .map(|_| required_sensitive(configuration, HTTP_PROXY_KEY))
+                .transpose()?
+                .map(ConnectorSecret::new)
+                .transpose()?,
         };
         result.validate()?;
         Ok(result)
@@ -331,8 +416,25 @@ impl RelayRouteConfiguration {
             || !matches!(relay.path(), "" | "/")
             || relay.query().is_some()
             || relay.fragment().is_some()
+            || !relay.username().is_empty()
+            || relay.password().is_some()
         {
             return Err(RelayConfigurationError::InvalidRelayUrl);
+        }
+        if self.transport == RelayPublicationTransport::WebSocket && relay.scheme() != "https" {
+            let loopback = match relay.host() {
+                Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+                None => false,
+            };
+            if !loopback {
+                return Err(RelayConfigurationError::InsecureIngress);
+            }
+        }
+        if let Some(proxy) = &self.http_proxy {
+            crate::rtc::proxy::checked_proxy(proxy.expose_secret())
+                .map_err(|_| RelayConfigurationError::InvalidProxy)?;
         }
         if self.relay_session_id.trim().is_empty()
             || self.publisher_group_id.trim().is_empty()
@@ -413,6 +515,12 @@ fn decode_ice_servers(encoded: &str) -> Result<Vec<RelayIceServer>, RelayConfigu
 
 #[derive(Debug, thiserror::Error)]
 pub enum RelayConfigurationError {
+    #[error("relay transport must be 'webrtc' or 'websocket'")]
+    InvalidTransport,
+    #[error("WebSocket Opus ingress requires HTTPS outside loopback")]
+    InsecureIngress,
+    #[error("relay proxy must be a valid HTTP or HTTPS CONNECT proxy origin")]
+    InvalidProxy,
     #[error("relay URL must be an absolute HTTP or HTTPS origin")]
     InvalidRelayUrl,
     #[error("relay Session and publisher group identifiers must be non-empty and bounded")]

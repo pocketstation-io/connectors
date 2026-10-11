@@ -21,7 +21,7 @@ use crate::configuration::{RelayLatencyProfile, RelayRouteConfiguration};
 use crate::frame_publisher::{
     run_prepared_frame_publisher, PreparedFramePublisher, PreparedFrameStream,
 };
-use crate::rtc::handshake::{cancel_handshake, run_handshake, PublishMedia};
+use crate::rtc::handshake::{run_handshake, PublishMedia};
 
 const FEEDER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_GROUPED_BUSES: usize = 16;
@@ -32,8 +32,20 @@ pub struct RelayPublishReceiptKey {
     pub route_id: RouteId,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct RelayPublishStatistics {
+    pub ingress_frames_sent_total: u64,
+    pub ingress_payload_bytes_sent_total: u64,
+    pub ingress_source_generation: u64,
+    pub ingress_attachments_total: u64,
+    pub ingress_renewals_total: u64,
+    pub ingress_reconnects_total: u64,
+    pub ingress_reconnect_attempts_total: u64,
+    pub ingress_recovery_input_frames_dropped_total: u64,
+    pub ingress_recovery_opus_packets_dropped_total: u64,
+    pub ingress_discontinuities_total: u64,
+    pub ingress_credential_revision: u64,
+
     pub rtp_packets_sent_total: u64,
     pub rtp_payload_bytes_sent_total: u64,
     pub rtc_poll_drains_total: u64,
@@ -46,6 +58,7 @@ pub struct RelayPublishStatistics {
     pub ingress_queue_drops_total: u64,
     pub cancelled_output_frames_total: u64,
     pub cancelled_output_samples_total: u64,
+    pub normalization_partial_samples_discarded_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,11 +99,22 @@ pub(crate) struct RelayConnectorFactory {
     transport: Arc<dyn RelayPublishTransport>,
     receipts: Arc<Mutex<HashMap<RelayPublishReceiptKey, RelayPublishReceipt>>>,
     receipt_capacity: usize,
+    control: Option<crate::RelayPublisherControl>,
 }
 
 impl RelayConnectorFactory {
     pub(crate) fn new(receipt_capacity: usize) -> Result<Self, ConnectorError> {
         Self::with_transport(Arc::new(NativeRelayPublishTransport), receipt_capacity)
+    }
+
+    pub(crate) fn with_publisher_control(
+        receipt_capacity: usize,
+        control: crate::RelayPublisherControl,
+    ) -> Result<Self, ConnectorError> {
+        control.snapshot().map_err(control_error)?;
+        let mut factory = Self::new(receipt_capacity)?;
+        factory.control = Some(control);
+        Ok(factory)
     }
 
     fn with_transport(
@@ -109,6 +133,7 @@ impl RelayConnectorFactory {
             transport,
             receipts: Arc::new(Mutex::new(HashMap::with_capacity(receipt_capacity))),
             receipt_capacity,
+            control: None,
         })
     }
 
@@ -196,6 +221,7 @@ impl ConnectorFactory for RelayConnectorFactory {
             transport_inputs.push(RelayTransportPreparation {
                 configuration,
                 sample_spec,
+                control: None,
             });
             routes.push(PreparedRelayRoute {
                 key,
@@ -205,6 +231,29 @@ impl ConnectorFactory for RelayConnectorFactory {
         }
 
         validate_grouped_routes(&transport_inputs)?;
+        self.bind_control(&mut transport_inputs)?;
+        let route_keys = self.reserve_receipts(&routes)?;
+
+        let prepared = match self.transport.prepare(transport_inputs) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                remove_receipts(&self.receipts, &route_keys);
+                return Err(error);
+            }
+        };
+        Ok(Box::new(RelayPublishWorker {
+            routes: Some(routes),
+            prepared: Some(prepared),
+            receipts: Arc::clone(&self.receipts),
+        }))
+    }
+}
+
+impl RelayConnectorFactory {
+    fn reserve_receipts(
+        &self,
+        routes: &[PreparedRelayRoute],
+    ) -> Result<Vec<RelayPublishReceiptKey>, ConnectorError> {
         let route_keys = routes.iter().map(|route| route.key).collect::<Vec<_>>();
         {
             let mut receipts = self.receipts.lock().map_err(|_| {
@@ -231,7 +280,7 @@ impl ConnectorFactory for RelayConnectorFactory {
                     "relay receipt already exists for a grouped endpoint route",
                 ));
             }
-            for route in &routes {
+            for route in routes {
                 receipts.insert(
                     route.key,
                     RelayPublishReceipt {
@@ -240,19 +289,26 @@ impl ConnectorFactory for RelayConnectorFactory {
                 );
             }
         }
+        Ok(route_keys)
+    }
 
-        let prepared = match self.transport.prepare(transport_inputs) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                remove_receipts(&self.receipts, &route_keys);
-                return Err(error);
+    fn bind_control(
+        &self,
+        transport_inputs: &mut [RelayTransportPreparation],
+    ) -> Result<(), ConnectorError> {
+        if let Some(control) = &self.control {
+            if transport_inputs
+                .iter()
+                .any(|route| !control.matches(&route.configuration))
+            {
+                return Err(relay_error("relay.publisher_control_scope_mismatch", ConnectorErrorStage::Configuration,
+                    ConnectorRetryability::Never, "publisher control must match every route's Relay origin, Session, group and WebSocket transport"));
             }
-        };
-        Ok(Box::new(RelayPublishWorker {
-            routes: Some(routes),
-            prepared: Some(prepared),
-            receipts: Arc::clone(&self.receipts),
-        }))
+            for route in transport_inputs {
+                route.control = Some(control.clone());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -294,6 +350,7 @@ fn remove_receipts(
 struct RelayTransportPreparation {
     configuration: RelayRouteConfiguration,
     sample_spec: SampleSpec,
+    control: Option<crate::RelayPublisherControl>,
 }
 
 trait RelayPublishTransport: Send + Sync {
@@ -320,6 +377,7 @@ struct NativePreparedRelayPublishTransport {
 }
 
 impl RelayPublishTransport for NativeRelayPublishTransport {
+    #[allow(clippy::too_many_lines)] // Bounded all-bus startup transaction and rollback.
     fn prepare(
         &self,
         routes: Vec<RelayTransportPreparation>,
@@ -338,43 +396,124 @@ impl RelayPublishTransport for NativeRelayPublishTransport {
             .clone();
         let mut streams = Vec::with_capacity(routes.len());
         let mut media = Vec::with_capacity(routes.len());
-        for route in routes {
-            let stream_profile = relay_stream_profile(route.sample_spec)?;
+        let mut ingress_connections = Vec::with_capacity(routes.len());
+        let control = routes[0].control.clone();
+        let lease = control
+            .as_ref()
+            .map(crate::RelayPublisherControl::claim)
+            .transpose()
+            .map_err(control_error)?;
+        let credential = control
+            .as_ref()
+            .map(crate::RelayPublisherControl::snapshot)
+            .transpose()
+            .map_err(control_error)?;
+        let startup_deadline = std::time::Instant::now() + configuration.startup_timeout;
+        let startup_deadline = credential.as_ref().map_or(startup_deadline, |value| {
+            startup_deadline
+                .min(value.valid_until)
+                .min(std::time::Instant::now() + crate::publisher_control::ATTACHMENT_TIMEOUT)
+        });
+        let mut ingress_configurations = Vec::with_capacity(routes.len());
+        let profiles = routes
+            .iter()
+            .map(|route| relay_stream_profile(route.sample_spec))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (route, stream_profile) in routes.into_iter().zip(profiles) {
+            let mut route_configuration = route.configuration;
+            if let Some(credential) = &credential {
+                route_configuration.source_token = credential.token.clone();
+            }
+            if configuration.transport == crate::RelayPublicationTransport::WebSocket {
+                match crate::rtc::gateway::prepare(
+                    &route_configuration,
+                    route.sample_spec.channels,
+                    startup_deadline,
+                ) {
+                    Ok(connection) => ingress_connections.push(connection),
+                    Err(error) => {
+                        let _ = crate::rtc::gateway::cancel(ingress_connections);
+                        return Err(relay_error(
+                            "relay.ingress_start_failed",
+                            ConnectorErrorStage::Startup,
+                            crate::rtc::gateway::retryability(error.as_ref()),
+                            error.to_string(),
+                        ));
+                    }
+                }
+                if let Some(control) = &control {
+                    if control.is_revoked()
+                        || control.revision()
+                            != credential.as_ref().map_or(0, |value| value.revision)
+                        || std::time::Instant::now() >= startup_deadline
+                    {
+                        let _ = crate::rtc::gateway::cancel(ingress_connections);
+                        return Err(relay_error(
+                            "relay.publisher_control_changed",
+                            ConnectorErrorStage::Startup,
+                            ConnectorRetryability::Never,
+                            "publisher capability changed, expired or was revoked during admission",
+                        ));
+                    }
+                }
+            }
             media.push(PublishMedia {
                 stereo: stream_profile.is_stereo(),
                 max_avg_bitrate_kbps: stream_profile.bitrate_kbps(),
-                stream_id: route.configuration.bus_id,
+                stream_id: route_configuration.bus_id.clone(),
             });
             streams.push(PreparedFrameStream {
                 profile: stream_profile,
-                latency_profile: match route.configuration.latency_profile {
+                latency_profile: match route_configuration.latency_profile {
                     RelayLatencyProfile::Standard => LatencyProfile::Standard,
                     RelayLatencyProfile::Low => LatencyProfile::Low,
                 },
                 counters: Arc::new(EncoderCounters::default()),
             });
+            ingress_configurations.push(route_configuration);
         }
-        let handshake = run_handshake(
-            &configuration.relay_url,
-            &configuration.relay_session_id,
-            configuration.source_token.expose_secret(),
-            &media,
-            &configuration.ice_servers,
-            configuration.startup_timeout,
-        )
-        .map_err(|error| {
-            relay_error(
-                "relay.handshake_failed",
-                ConnectorErrorStage::Startup,
-                ConnectorRetryability::Retryable,
-                format!("relay handshake failed: {error}"),
-            )
-        })?;
+        let ingress_recovery =
+            control
+                .zip(credential)
+                .zip(lease)
+                .map(|((control, credential), lease)| {
+                    crate::rtc::gateway::PreparedIngressRecovery {
+                        control,
+                        credential,
+                        configurations: ingress_configurations,
+                        delivery: crate::rtc::gateway::IngressDeliveryState::new(streams.len()),
+                        _lease: lease,
+                    }
+                });
+        let transport = if configuration.transport == crate::RelayPublicationTransport::WebSocket {
+            crate::frame_publisher::PreparedMediaTransport::WebSocket(ingress_connections)
+        } else {
+            crate::frame_publisher::PreparedMediaTransport::WebRtc(Box::new(
+                run_handshake(
+                    &configuration.relay_url,
+                    &configuration.relay_session_id,
+                    configuration.source_token.expose_secret(),
+                    &media,
+                    &configuration.ice_servers,
+                    configuration.http_proxy.as_ref(),
+                    configuration.startup_timeout,
+                )
+                .map_err(|error| {
+                    relay_error(
+                        "relay.handshake_failed",
+                        ConnectorErrorStage::Startup,
+                        ConnectorRetryability::Retryable,
+                        format!("relay handshake failed: {error}"),
+                    )
+                })?,
+            ))
+        };
         Ok(Box::new(NativePreparedRelayPublishTransport {
             publisher: PreparedFramePublisher {
-                handshake,
+                transport,
                 session_id: configuration.relay_session_id,
                 streams,
+                ingress_recovery,
             },
         }))
     }
@@ -442,6 +581,10 @@ impl PreparedRelayPublishTransport for NativePreparedRelayPublishTransport {
         let transport_stop = Arc::new(AtomicBool::new(false));
         let mut frame_receivers = Vec::with_capacity(routes.len());
         let mut feeders = Vec::with_capacity(routes.len());
+        let delivery = publisher
+            .ingress_recovery
+            .as_ref()
+            .map(|recovery| Arc::clone(&recovery.delivery));
 
         for (index, (route, stream)) in routes.into_iter().zip(publisher.streams.iter()).enumerate()
         {
@@ -452,6 +595,7 @@ impl PreparedRelayPublishTransport for NativePreparedRelayPublishTransport {
             let feeder_context = context.clone();
             let feeder_state = Arc::clone(&route.state);
             let mut receiver = route.receiver;
+            let feeder_delivery = delivery.clone();
             let feeder = thread::Builder::new()
                 .name(format!("pks-relay-bus-feed-{index}"))
                 .spawn(move || {
@@ -463,6 +607,22 @@ impl PreparedRelayPublishTransport for NativePreparedRelayPublishTransport {
                         }
                         if let Some(frame) = receiver.try_recv() {
                             feeder_context.record_frame_received(1);
+                            if let Some(delivery) = &feeder_delivery {
+                                let sample_frames =
+                                    frame.samples().len() / usize::from(frame.channels());
+                                let duration_ns = u64::try_from(sample_frames)
+                                    .unwrap_or(u64::MAX)
+                                    .saturating_mul(1_000_000_000)
+                                    / 48_000;
+                                delivery.capture_end_ns[index].fetch_max(
+                                    frame.timestamp_ns().saturating_add(duration_ns),
+                                    Ordering::Release,
+                                );
+                                if delivery.paused.load(Ordering::Acquire) {
+                                    delivery.input_drops[index].fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                            }
                             match frame_tx.try_send(frame) {
                                 Ok(()) => {}
                                 Err(mpsc::TrySendError::Full(_)) => {
@@ -509,7 +669,7 @@ impl PreparedRelayPublishTransport for NativePreparedRelayPublishTransport {
             }
         }
 
-        let execution = run_prepared_frame_publisher(publisher, frame_receivers);
+        let execution = run_prepared_frame_publisher(publisher, frame_receivers, &context);
         transport_stop.store(true, Ordering::Release);
         let mut receivers = Vec::with_capacity(feeders.len());
         let mut feeder_failed = false;
@@ -523,22 +683,40 @@ impl PreparedRelayPublishTransport for NativePreparedRelayPublishTransport {
         }
 
         let (publish_stats, mut shared_error) = match execution {
-            Ok(execution) => {
+            Ok(mut execution) => {
+                // Read after all feeders join so the terminal pause/drop race
+                // cannot omit a final consumed PCM frame from its receipt.
+                if let (Some(delivery), Ok(stats)) = (&delivery, &mut execution.result) {
+                    for (index, stream) in stats.streams.iter_mut().enumerate() {
+                        stream.ingress_recovery_input_drops =
+                            delivery.input_drops[index].load(Ordering::Relaxed);
+                    }
+                }
+                let ingress_error = execution.ingress_error.map(|error| {
+                    relay_error(
+                        "relay.publisher_failed",
+                        ConnectorErrorStage::Delivery,
+                        crate::rtc::gateway::retryability(error.as_ref()),
+                        error.to_string(),
+                    )
+                });
                 let publish_result = execution.result.map_err(|error| error.to_string());
                 let encoder_failed = execution
                     .encoder_threads
                     .into_iter()
                     .any(|encoder| encoder.join().is_err());
                 match (publish_result, encoder_failed) {
-                    (Ok(stats), false) => (Some(stats), None),
+                    (Ok(stats), false) => (Some(stats), ingress_error),
                     (Ok(stats), true) => (
                         Some(stats),
-                        Some(relay_error(
-                            "relay.encoder_panicked",
-                            ConnectorErrorStage::Delivery,
-                            ConnectorRetryability::Retryable,
-                            "relay encoder thread panicked",
-                        )),
+                        ingress_error.or_else(|| {
+                            Some(relay_error(
+                                "relay.encoder_panicked",
+                                ConnectorErrorStage::Delivery,
+                                ConnectorRetryability::Retryable,
+                                "relay encoder thread panicked",
+                            ))
+                        }),
                     ),
                     (Err(error), _) => (
                         None,
@@ -579,7 +757,9 @@ impl PreparedRelayPublishTransport for NativePreparedRelayPublishTransport {
                     .normalization_partial_samples_discarded
                     .load(Ordering::Relaxed);
                 let mut error = shared_error.clone();
-                if error.is_none() && (encode_errors > 0 || partial_samples_discarded > 0) {
+                let recovered = publish_stats.as_ref().and_then(|stats| stats.streams.get(index))
+                    .is_some_and(|stats| stats.ingress_discontinuities > 0);
+                if error.is_none() && (encode_errors > 0 || (partial_samples_discarded > 0 && !recovered)) {
                     error = Some(relay_error(
                         "relay.audio_processing_failed",
                         ConnectorErrorStage::Delivery,
@@ -616,14 +796,17 @@ impl PreparedRelayPublishTransport for NativePreparedRelayPublishTransport {
     }
 
     fn cancel(self: Box<Self>) -> Result<(), ConnectorError> {
-        cancel_handshake(self.publisher.handshake, &self.publisher.session_id).map_err(|error| {
-            relay_error(
-                "relay.preparation_cancel_failed",
-                ConnectorErrorStage::Shutdown,
-                ConnectorRetryability::Retryable,
-                error.to_string(),
-            )
-        })
+        self.publisher
+            .transport
+            .cancel(&self.publisher.session_id)
+            .map_err(|error| {
+                relay_error(
+                    "relay.preparation_cancel_failed",
+                    ConnectorErrorStage::Shutdown,
+                    ConnectorRetryability::Retryable,
+                    error.to_string(),
+                )
+            })
     }
 }
 
@@ -730,7 +913,12 @@ fn record_outcome(context: &ConnectorContext, outcome: &RelayTransportOutcome) {
             .saturating_add(outcome.statistics.encoder_channel_drops_total)
             .saturating_add(outcome.statistics.publisher_stale_drops_total),
     );
-    context.record_discontinuity(outcome.edge_observations.discontinuities_total);
+    context.record_discontinuity(
+        outcome
+            .edge_observations
+            .discontinuities_total
+            .saturating_add(outcome.statistics.ingress_discontinuities_total),
+    );
 }
 
 struct RelayTransportOutcome {
@@ -760,6 +948,22 @@ fn statistics(
     stream: Option<&crate::rtc::publisher::PublishStreamStats>,
 ) -> RelayPublishStatistics {
     RelayPublishStatistics {
+        ingress_frames_sent_total: stream.map_or(0, |stats| stats.ingress_frames_sent),
+        ingress_payload_bytes_sent_total: stream
+            .map_or(0, |stats| stats.ingress_payload_bytes_sent),
+        ingress_source_generation: stream.map_or(0, |stats| stats.ingress_source_generation),
+        ingress_attachments_total: stream.map_or(0, |stats| stats.ingress_attachments),
+        ingress_renewals_total: stream.map_or(0, |stats| stats.ingress_renewals),
+        ingress_reconnects_total: stream.map_or(0, |stats| stats.ingress_reconnects),
+        ingress_reconnect_attempts_total: stream
+            .map_or(0, |stats| stats.ingress_reconnect_attempts),
+        ingress_recovery_input_frames_dropped_total: stream
+            .map_or(0, |stats| stats.ingress_recovery_input_drops),
+        ingress_recovery_opus_packets_dropped_total: stream
+            .map_or(0, |stats| stats.ingress_recovery_opus_drops),
+        ingress_discontinuities_total: stream.map_or(0, |stats| stats.ingress_discontinuities),
+        ingress_credential_revision: stream.map_or(0, |stats| stats.ingress_credential_revision),
+
         rtp_packets_sent_total: stream.map_or(0, |stats| stats.rtp_sent),
         rtp_payload_bytes_sent_total: stream.map_or(0, |stats| stats.bytes_sent),
         rtc_poll_drains_total: publish.map_or(0, |stats| stats.drains),
@@ -774,6 +978,9 @@ fn statistics(
         ingress_queue_drops_total: state.ingress_queue_drops_total.load(Ordering::Relaxed),
         cancelled_output_frames_total: counters.cancelled_output_frames.load(Ordering::Relaxed),
         cancelled_output_samples_total: counters.cancelled_output_samples.load(Ordering::Relaxed),
+        normalization_partial_samples_discarded_total: counters
+            .normalization_partial_samples_discarded
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -798,6 +1005,15 @@ fn relay_error(
         message,
     )
     .expect("relay error messages are bounded and non-empty")
+}
+
+fn control_error(error: crate::RelayPublisherControlError) -> ConnectorError {
+    relay_error(
+        "relay.publisher_control_unavailable",
+        ConnectorErrorStage::Configuration,
+        ConnectorRetryability::Never,
+        error.to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -1257,9 +1473,18 @@ mod tests {
             ConnectorSecret::new("never-print-this").expect("secret"),
             "application",
         )
-        .expect("configuration");
+        .expect("configuration")
+        .with_websocket_ingress()
+        .expect("ingress configuration")
+        .with_http_proxy(
+            ConnectorSecret::new("http://proxy-user:proxy-secret@proxy.invalid:8080")
+                .expect("proxy secret"),
+        )
+        .expect("proxy configuration");
         let debug = format!("{configuration:?}");
         assert!(!debug.contains("never-print-this"));
+        assert!(!debug.contains("proxy-user"));
+        assert!(!debug.contains("proxy-secret"));
         let resolved = manifest
             .configuration()
             .resolve(
@@ -1269,5 +1494,15 @@ mod tests {
             )
             .expect("resolved configuration");
         assert!(!format!("{resolved:?}").contains("never-print-this"));
+        assert!(!format!("{resolved:?}").contains("proxy-secret"));
+        assert!(RelayRouteConfiguration::new(
+            "http://relay.invalid",
+            "session-a",
+            ConnectorSecret::new("capability").unwrap(),
+            "application"
+        )
+        .unwrap()
+        .with_websocket_ingress()
+        .is_err());
     }
 }

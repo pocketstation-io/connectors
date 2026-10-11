@@ -83,6 +83,17 @@ pub(crate) struct PublishStats {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PublishStreamStats {
+    pub(crate) ingress_frames_sent: u64,
+    pub(crate) ingress_payload_bytes_sent: u64,
+    pub(crate) ingress_source_generation: u64,
+    pub(crate) ingress_attachments: u64,
+    pub(crate) ingress_renewals: u64,
+    pub(crate) ingress_reconnects: u64,
+    pub(crate) ingress_reconnect_attempts: u64,
+    pub(crate) ingress_recovery_input_drops: u64,
+    pub(crate) ingress_recovery_opus_drops: u64,
+    pub(crate) ingress_discontinuities: u64,
+    pub(crate) ingress_credential_revision: u64,
     pub(crate) rtp_sent: u64,
     pub(crate) bytes_sent: u64,
 }

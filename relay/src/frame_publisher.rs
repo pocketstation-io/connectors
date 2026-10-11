@@ -15,9 +15,26 @@ use crate::rtc::publisher::{
 pub(crate) const BUS_MAX_LEN: usize = 64;
 
 pub(crate) struct PreparedFramePublisher {
-    pub(crate) handshake: HandshakeResult,
+    pub(crate) transport: PreparedMediaTransport,
     pub(crate) session_id: String,
     pub(crate) streams: Vec<PreparedFrameStream>,
+    pub(crate) ingress_recovery: Option<crate::rtc::gateway::PreparedIngressRecovery>,
+}
+
+pub(crate) enum PreparedMediaTransport {
+    WebRtc(Box<HandshakeResult>),
+    WebSocket(Vec<crate::rtc::gateway::IngressConnection>),
+}
+
+impl PreparedMediaTransport {
+    pub(crate) fn cancel(self, session_id: &str) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::WebRtc(handshake) => {
+                crate::rtc::handshake::cancel_handshake(*handshake, session_id)
+            }
+            Self::WebSocket(connections) => crate::rtc::gateway::cancel(connections),
+        }
+    }
 }
 
 pub(crate) struct PreparedFrameStream {
@@ -28,29 +45,25 @@ pub(crate) struct PreparedFrameStream {
 
 pub(crate) struct FramePublisherExecution {
     pub(crate) result: Result<PublishStats, Box<dyn Error>>,
+    pub(crate) ingress_error: Option<Box<dyn Error>>,
     pub(crate) encoder_threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 pub(crate) fn run_prepared_frame_publisher<F>(
     prepared: PreparedFramePublisher,
     frame_receivers: Vec<mpsc::Receiver<F>>,
+    context: &pocketstation::connector::ConnectorContext,
 ) -> Result<FramePublisherExecution, Box<dyn Error>>
 where
     F: EncodableFrame,
 {
-    let HandshakeResult {
-        rtc,
-        ws,
-        mids,
-        bound_addr,
-        udp,
-    } = prepared.handshake;
-    if mids.len() != prepared.streams.len() || mids.len() != frame_receivers.len() {
+    let stream_count = prepared.streams.len();
+    if stream_count != frame_receivers.len() {
         return Err("relay publisher media, stream and receiver counts do not match".into());
     }
-    let mut encoder_threads = Vec::with_capacity(mids.len());
-    let mut publish_streams = Vec::with_capacity(mids.len());
-    for ((mid, stream), frame_rx) in mids.into_iter().zip(prepared.streams).zip(frame_receivers) {
+    let mut encoder_threads = Vec::with_capacity(stream_count);
+    let mut encoded_streams = Vec::with_capacity(stream_count);
+    for (stream, frame_rx) in prepared.streams.into_iter().zip(frame_receivers) {
         let (encoded_tx, encoded_rx) =
             mpsc::sync_channel::<EncodedAudioFrame>(stream.latency_profile.encoded_channel_depth());
         let encoder = spawn_opus_encoder(
@@ -62,26 +75,67 @@ where
         )
         .map_err(|error| format!("encoder thread spawn: {error}"))?;
         encoder_threads.push(encoder);
-        publish_streams.push(PublishStream {
-            mid,
-            encoded_rx,
-            backlog_policy: match stream.latency_profile {
-                LatencyProfile::Low => PublisherBacklogPolicy::DropStale,
-                LatencyProfile::Standard => PublisherBacklogPolicy::Preserve,
-            },
-            counters: stream.counters,
-        });
+        encoded_streams.push((stream, encoded_rx));
     }
-    let result = run_publish_loop(
-        rtc,
-        udp,
-        ws,
-        bound_addr,
-        publish_streams,
-        &prepared.session_id,
-    );
+    let mut ingress_error = None;
+    let result = match prepared.transport {
+        PreparedMediaTransport::WebRtc(handshake) => {
+            let HandshakeResult {
+                rtc,
+                ws,
+                mids,
+                bound_addr,
+                udp,
+            } = *handshake;
+            if mids.len() != stream_count {
+                return Err("relay media and encoded stream counts do not match".into());
+            }
+            let streams = mids
+                .into_iter()
+                .zip(encoded_streams)
+                .map(|(mid, (stream, encoded_rx))| PublishStream {
+                    mid,
+                    encoded_rx,
+                    backlog_policy: match stream.latency_profile {
+                        LatencyProfile::Low => PublisherBacklogPolicy::DropStale,
+                        LatencyProfile::Standard => PublisherBacklogPolicy::Preserve,
+                    },
+                    counters: stream.counters,
+                })
+                .collect();
+            run_publish_loop(rtc, udp, ws, bound_addr, streams, &prepared.session_id)
+        }
+        PreparedMediaTransport::WebSocket(connections) => {
+            if connections.len() != stream_count {
+                return Err("relay ingress and encoded stream counts do not match".into());
+            }
+            let streams = connections
+                .into_iter()
+                .zip(encoded_streams)
+                .map(
+                    |(connection, (stream, encoded_rx))| crate::rtc::gateway::IngressStream {
+                        connection,
+                        encoded_rx,
+                        counters: stream.counters,
+                    },
+                )
+                .collect();
+            let outcome = if prepared.ingress_recovery.is_some() {
+                crate::rtc::gateway::run_with_recovery(
+                    streams,
+                    prepared.ingress_recovery,
+                    Some(context),
+                )
+            } else {
+                crate::rtc::gateway::run(streams)
+            };
+            ingress_error = outcome.error;
+            Ok(outcome.statistics)
+        }
+    };
     Ok(FramePublisherExecution {
         result,
+        ingress_error,
         encoder_threads,
     })
 }
