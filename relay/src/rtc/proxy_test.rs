@@ -24,7 +24,7 @@ fn fixture_socket(listener: &TcpListener) -> std::net::TcpStream {
                 );
                 std::thread::sleep(Duration::from_millis(2));
             }
-            Err(_) => panic!("fixture listener failed"),
+            Err(error) => panic!("fixture listener failed: {:?}", error.kind()),
         }
     }
 }
@@ -147,7 +147,7 @@ fn given_untrusted_proxy_certificate_when_using_public_defaults_then_proxy_tls_r
     ))
     .unwrap();
     let server = std::thread::spawn(move || {
-        assert_no_application_bytes(acceptor.accept(fixture_socket(&listener)))
+        assert_no_application_bytes(acceptor.accept(fixture_socket(&listener)));
     });
     let error = connect(
         "wss://relay-fixture.invalid/stem",
@@ -173,7 +173,7 @@ fn given_trusted_proxy_certificate_for_another_host_when_connecting_then_hostnam
     let proxy =
         ConnectorSecret::new(format!("https://{}", listener.local_addr().unwrap())).unwrap();
     let server = std::thread::spawn(move || {
-        assert_no_application_bytes(acceptor.accept(fixture_socket(&listener)))
+        assert_no_application_bytes(acceptor.accept(fixture_socket(&listener)));
     });
     let error = connect_with_tls(
         "wss://relay-fixture.invalid/stem",
