@@ -175,13 +175,12 @@ fn connect_proxy_stream(
     set_deadline(&tcp, deadline)?;
     let host = proxy.host_str().ok_or("Relay proxy URL has no host")?;
     let default_connector;
-    let connector = match connector {
-        Some(connector) => connector,
-        None => {
-            default_connector = native_tls::TlsConnector::new()
-                .map_err(|_| ProxyConnectError::ProxyTlsHandshake)?;
-            &default_connector
-        }
+    let connector = if let Some(connector) = connector {
+        connector
+    } else {
+        default_connector = native_tls::TlsConnector::new()
+            .map_err(|_| ProxyConnectError::ProxyTlsHandshake)?;
+        &default_connector
     };
     let tls = connector
         .connect(host, tcp)
@@ -296,9 +295,9 @@ fn connect_tcp(
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or("Relay connection exceeded its startup deadline")?;
-        if let Ok(mut stream) = TcpStream::connect_timeout(&address, remaining) {
+        if let Ok(stream) = TcpStream::connect_timeout(&address, remaining) {
             stream.set_nodelay(true)?;
-            set_deadline(&mut stream, deadline)?;
+            set_deadline(&stream, deadline)?;
             return Ok(stream);
         }
     }
