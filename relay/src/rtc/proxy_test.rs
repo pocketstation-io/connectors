@@ -40,7 +40,7 @@ fn fixture_pem(label: &str, der: &[u8]) -> Vec<u8> {
 }
 
 fn tls_fixture(name: &str) -> (native_tls::TlsAcceptor, native_tls::TlsConnector) {
-    let key = rcgen::KeyPair::generate().unwrap();
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
     let mut params = rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params.key_usages = vec![
