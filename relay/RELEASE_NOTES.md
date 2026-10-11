@@ -1,5 +1,30 @@
 # PocketStation Relay connector release notes
 
+## 0.1.6 — Verified proxy TLS and independent audio buses
+
+Application and microphone AudioBuses can publish Opus through authenticated
+WSS and explicitly configured HTTP or HTTPS CONNECT proxies. HTTPS verifies
+the proxy certificate and hostname; WSS separately verifies the Relay service.
+Proxy credentials and the source capability are sent to their respective
+services. Connection deadlines remain finite and failure never falls back direct.
+
+Grouped publication retains source generations, per-bus loss observations,
+owner renewal and revocation/expiry cancellation through the existing
+publisher control. Registry publication binds the selected immutable tag in
+both validation and publication jobs, including an explicit recovery event.
+
+### Authorized AudioBus input
+
+The package can subscribe to one capability-scoped Relay `AudioBus`, wait for
+the first real Opus packet, decode the qualified 48 kHz mono / 20 ms profile,
+and expose it through Core's external `Source` lifecycle. Source generation,
+RTP discontinuity, delivery loss counts, startup failure, runtime failure,
+and deterministic close remain observable.
+
+This work requires PocketStation Core 1.1.10 for the explicit Opus codec
+feature. WAN/TURN connectivity, browser decode, physical capture and model
+output require separate product evidence.
+
 ## 0.1.5 — Clear package description
 
 The package description now states that the Connector publishes PocketStation

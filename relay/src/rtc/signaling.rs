@@ -36,6 +36,16 @@ pub(crate) struct PublishMsg<'a> {
 }
 
 #[derive(Serialize)]
+pub(crate) struct SubscribeMsg<'a> {
+    #[serde(rename = "type")]
+    pub(crate) msg_type: &'a str,
+    pub(crate) room_id: &'a str,
+    pub(crate) token: &'a str,
+    pub(crate) sdp_offer: &'a str,
+    pub(crate) bus_id: &'a str,
+}
+
+#[derive(Serialize)]
 pub(crate) struct LeaveMsg<'a> {
     #[serde(rename = "type")]
     pub(crate) msg_type: &'a str,
@@ -58,7 +68,7 @@ pub(crate) struct ServerMsg {
 
 // Convenience type alias
 
-pub(crate) type Ws = tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>;
+pub(crate) type Ws = tungstenite::WebSocket<MaybeTlsStream<super::proxy::ProxyStream>>;
 
 pub(crate) const WS_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 pub(crate) const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -74,28 +84,25 @@ pub(crate) struct SignalingAnswer {
 // Set a read timeout on the underlying TCP stream inside a tungstenite WebSocket.
 
 pub(crate) fn ws_set_read_timeout(ws: &Ws, timeout: Option<Duration>) -> io::Result<()> {
-    // MaybeTlsStream exposes the inner stream reference.  We need to reach
-    // the TcpStream to call set_read_timeout.  Match on all known variants;
-    // use a wildcard for any future variant added by tungstenite.
-    match ws.get_ref() {
-        MaybeTlsStream::Plain(tcp) => tcp.set_read_timeout(timeout),
-        MaybeTlsStream::NativeTls(tls) => tls.get_ref().set_read_timeout(timeout),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "relay WebSocket transport does not expose a readable TCP timeout",
-        )),
-    }
+    super::proxy::socket(ws)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Relay deadline socket unavailable",
+            )
+        })?
+        .set_read_timeout(timeout)
 }
 
 pub(crate) fn ws_set_write_timeout(ws: &Ws, timeout: Option<Duration>) -> io::Result<()> {
-    match ws.get_ref() {
-        MaybeTlsStream::Plain(tcp) => tcp.set_write_timeout(timeout),
-        MaybeTlsStream::NativeTls(tls) => tls.get_ref().set_write_timeout(timeout),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "relay WebSocket transport does not expose a writable TCP timeout",
-        )),
-    }
+    super::proxy::socket(ws)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Relay deadline socket unavailable",
+            )
+        })?
+        .set_write_timeout(timeout)
 }
 
 /// Block on the WebSocket until we receive an `SDP_ANSWER`; return the SDP string.
@@ -149,7 +156,7 @@ pub(crate) fn send_leave(ws: &mut Ws, room_id: &str) -> Result<(), Box<dyn std::
 
 #[cfg(test)]
 mod tests {
-    use super::{PublishBusBinding, PublishMsg};
+    use super::{PublishBusBinding, PublishMsg, SubscribeMsg};
 
     #[test]
     fn grouped_publish_uses_canonical_wire_names_without_legacy_bus() {
@@ -176,5 +183,22 @@ mod tests {
         assert!(encoded.get("bus_id").is_none());
         assert_eq!(encoded["publish_buses"][0]["stream_id"], "application");
         assert_eq!(encoded["publish_buses"][1]["bus_id"], "microphone");
+    }
+
+    #[test]
+    fn subscribe_names_exact_session_and_bus() {
+        let encoded = serde_json::to_value(SubscribeMsg {
+            msg_type: "SUBSCRIBE",
+            room_id: "session-7",
+            token: "subscriber-secret",
+            sdp_offer: "v=0",
+            bus_id: "phone-microphone",
+        })
+        .unwrap();
+
+        assert_eq!(encoded["type"], "SUBSCRIBE");
+        assert_eq!(encoded["room_id"], "session-7");
+        assert_eq!(encoded["bus_id"], "phone-microphone");
+        assert_eq!(encoded["token"], "subscriber-secret");
     }
 }
