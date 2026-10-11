@@ -8,6 +8,7 @@ fn fixture_socket(listener: &TcpListener) -> std::net::TcpStream {
     loop {
         match listener.accept() {
             Ok((socket, _)) => {
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
