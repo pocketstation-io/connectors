@@ -178,8 +178,8 @@ fn connect_proxy_stream(
     let connector = if let Some(connector) = connector {
         connector
     } else {
-        default_connector = native_tls::TlsConnector::new()
-            .map_err(|_| ProxyConnectError::ProxyTlsHandshake)?;
+        default_connector =
+            native_tls::TlsConnector::new().map_err(|_| ProxyConnectError::ProxyTlsHandshake)?;
         &default_connector
     };
     let tls = connector
